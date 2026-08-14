@@ -1,0 +1,17 @@
+# --- НІКОЛИ не комітити: доступ до Google Drive ---
+# rclone.conf містить refresh_token = повний доступ до акаунта.
+# Зазвичай він у %APPDATA%\rclone\, але якщо колись rclone буде 
+# портативним через --config, він опиниться тут, поруч зі скриптом.
+rclone.conf
+rclone.conf.*
+settings.json
+
+# --- сторонній бінарник: 85 МБ, качається окремо (див. README) ---
+rclone.exe
+rclone
+
+# --- службове ---
+__pycache__/
+*.py[cod]
+*.bak
+*.log
