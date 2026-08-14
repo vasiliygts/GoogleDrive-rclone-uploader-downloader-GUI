@@ -276,6 +276,13 @@ class RcloneWorker(threading.Thread):
                         lvl = obj.get("level", "")
                         if msg and lvl in ("error", "warning", "notice"):
                             self.emit("log", f"[{lvl}] {msg}")
+                            # Google віддає голий 400 на спробу створити теку
+                            # в корені розділу «Комп'ютери» — підкажемо, що робити
+                            if "badRequest" in msg and "make directory" in msg:
+                                self.emit("log",
+                                          "    ↳ Якщо призначення — корінь теки «Комп'ютери», "
+                                          "Google не дозволяє створювати там нові теки. "
+                                          "Обери призначенням наявну теку рівнем нижче.")
                         elif msg:
                             self.emit("log", msg)
                 else:
@@ -607,6 +614,17 @@ class App(tk.Tk):
             self.var_remote.set(saved if saved in self.remotes else self.remotes[0])
             self._load_remote_root()
         else:
+            # Найчастіше remote «зникають» не тому, що їх немає, а тому що
+            # rclone дивиться в інший конфіг. Показуємо, який саме.
+            try:
+                rf = run_capture([exe, "config", "file"], timeout=20)
+                lines = ((rf.stdout or "") + (rf.stderr or "")).strip().splitlines()
+                path = lines[-1].strip() if lines else ""
+                if path:
+                    self._log(f"rclone читає конфіг: {path}"
+                              f"   (файл {'на місці' if Path(path).exists() else 'ВІДСУТНІЙ'})")
+            except Exception:
+                pass
             self._log("Немає жодного налаштованого remote. Натисни «⚙ rclone config» "
                       "→ n → ім'я (напр. gdrive) → drive → далі за майстром.")
         self._load_local_roots()

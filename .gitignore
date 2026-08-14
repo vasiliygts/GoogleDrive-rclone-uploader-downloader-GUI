@@ -10,6 +10,11 @@ settings.json
 rclone.exe
 rclone
 
+# --- робочі переліки з Drive ---
+# містять імена файлів, а серед них трапляються паролі й чужі адреси
+zero_files.txt
+zero_mp4.txt
+
 # --- службове ---
 __pycache__/
 *.py[cod]
