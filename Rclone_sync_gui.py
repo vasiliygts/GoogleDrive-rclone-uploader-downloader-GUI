@@ -49,6 +49,95 @@ OVERWRITE = {
     "never": "Не чіпати існуючі (--ignore-existing)",
 }
 
+# Готові профілі: кожен задає і прапорці, і кількість потоків.
+#
+# Поріг --drive-upload-cutoff (8 МіБ) ділить файли надвоє: дрібніші йдуть
+# одним запитом, і розмір частини для них не важить; більші ріжуться на
+# частини по --drive-chunk-size, і кожна частина — окремий запит.
+# Звідси й різниця: великим потрібні великі частини й мало потоків,
+# дрібним — навпаки, бо там вузьке місце не канал, а звернення до API.
+#
+# --tpslimit усюди, поки використовується спільний client_id rclone:
+# він тримає нас нижче межі замість того, щоб натикатись на 403.
+PROFILES = {
+    "Великі файли (100 МБ – 1 ГБ)": {
+        "flags": "--drive-chunk-size 128M --tpslimit 10 --tpslimit-burst 10",
+        "transfers": 2,
+        "note": "Мало потоків, великі частини. На файл припадає менше запитів, "
+                "тож менший шанс, що заливка обірветься і почнеться з нуля. "
+                "Пам'ять ~256 МБ (128M × 2 потоки).",
+    },
+    "Дрібні файли (до кількох МБ)": {
+        "flags": "--drive-chunk-size 16M --fast-list --tpslimit 10 --tpslimit-burst 10",
+        "transfers": 12,
+        "note": "Тут вузьке місце не канал, а звернення до API — рятує паралелізм. "
+                "Розмір частини не важить: файли й так менші за поріг 8 МіБ. "
+                "--fast-list пришвидшує сканування дерева.",
+    },
+    "Суміш (універсальний)": {
+        "flags": "--drive-chunk-size 32M --tpslimit 10 --tpslimit-burst 10",
+        "transfers": 4,
+        "note": "Компроміс, коли ліньки розбивати на два проходи. "
+                "Працює прийнятно скрізь, але поступається парі проходів "
+                "на теках зі змішаним вмістом.",
+    },
+    # Два проходи по тій самій парі «джерело → призначення»: спершу дрібні
+    # з високим паралелізмом, потім великі з великими частинами. На змішаних
+    # теках це помітно швидше за будь-який усереднений набір.
+    # Файл рівно 64 МБ підпадає під обидва фільтри, але другий прохід
+    # побачить його вже завантаженим і пропустить.
+    "Суміш · прохід 1 — дрібні (≤64 МБ)": {
+        "flags": "--max-size 64M --drive-chunk-size 16M --fast-list "
+                 "--tpslimit 10 --tpslimit-burst 10",
+        "transfers": 12,
+        "note": "Перший з двох проходів по ТІЙ САМІЙ черзі. Бере лише файли "
+                "до 64 МБ і жене їх дванадцятьма потоками. Далі, не міняючи "
+                "черги, вибери прохід 2.",
+    },
+    "Суміш · прохід 2 — великі (≥64 МБ)": {
+        "flags": "--min-size 64M --drive-chunk-size 128M "
+                 "--tpslimit 10 --tpslimit-burst 10",
+        "transfers": 2,
+        "note": "Другий прохід: тільки файли від 64 МБ, двома потоками. "
+                "Черга та сама, переформовувати не треба — фільтр сам "
+                "відбере потрібне. Порядок проходів неважливий.",
+    },
+}
+
+# Коротка довідка, щоб не лазити в документацію rclone
+FLAG_HELP = [
+    ("--drive-chunk-size N",
+     "Розмір частини при заливці файлів, більших за 8 МіБ. Більше — менше "
+     "запитів на файл і швидше, але й більше пам'яті: N × кількість потоків."),
+    ("--tpslimit N",
+     "Не більше N запитів до API за секунду. Головний засіб проти помилки "
+     "403 rate limit: тримає нижче межі замість того, щоб натикатись на неї."),
+    ("--tpslimit-burst N",
+     "Дозволений короткий сплеск запитів. Без нього обмежено одним, "
+     "що надто жорстко — ставте приблизно як --tpslimit."),
+    ("--fast-list",
+     "Читає дерево рекурсивно за один прохід: більше пам'яті, але значно "
+     "менше запитів. Вигідно на теках з великою кількістю підтек."),
+    ("--max-size N / --min-size N",
+     "Брати лише файли не більші / не менші за N. Файл рівно N підпадає "
+     "під обидва фільтри."),
+    ("--exclude ШАБЛОН",
+     "Пропустити те, що збігається. Шаблон із пробілами — у лапках: "
+     "--exclude \"Мої фото/**\""),
+    ("--create-empty-src-dirs",
+     "Переносити й порожні теки: режим copy їх типово пропускає."),
+    ("--bwlimit N",
+     "Обмежити швидкість, наприклад --bwlimit 2M, щоб не забивати канал."),
+    ("--drive-use-trash=false",
+     "Видаляти назовсім, повз кошик. Обережно: відкату не буде."),
+    ("--drive-skip-shortcuts",
+     "Не чіпати ярлики Google Drive — вони мають нульовий розмір і легко "
+     "потрапляють під фільтри за розміром."),
+]
+
+# ці набори завжди присутні у випадному списку прапорців
+PRESET_FLAGS = [p["flags"] for p in PROFILES.values()]
+
 
 # --------------------------------------------------------------------------- #
 #  Утиліти
@@ -74,6 +163,24 @@ def find_rclone() -> str:
         if Path(c).exists():
             return c
     return ""
+
+
+def rclone_error(stderr: str, limit: int = 300) -> str:
+    """Витягує з виводу rclone саме помилку.
+
+    Перший рядок stderr — це зазвичай NOTICE про спільний client_id,
+    і показувати його як причину збою тільки збиває з пантелику.
+    """
+    lines = [l.strip() for l in (stderr or "").splitlines() if l.strip()]
+    lines = [l for l in lines if "client_id" not in l]
+    pick = next((l for l in lines if "ERROR" in l), "") \
+        or next((l for l in lines if "Failed" in l), "") \
+        or (lines[-1] if lines else "невідома помилка")
+    for tag in ("ERROR :", "NOTICE:", "INFO  :"):
+        if tag in pick:
+            pick = pick.split(tag, 1)[1].strip()
+            break
+    return pick[:limit]
 
 
 def split_flags(s: str) -> list:
@@ -348,6 +455,7 @@ class App(tk.Tk):
         except tk.TclError:
             pass
         style.configure("Treeview", rowheight=22)
+        self._bind_clipboard_by_keycode()
 
         # --- закріплена нижня смуга: прогрес і Старт/Стоп поза прокруткою ---
         bottom_fixed = ttk.Frame(self)
@@ -522,9 +630,29 @@ class App(tk.Tk):
             .grid(row=1, column=3, sticky="w", padx=4, pady=(6, 0))
 
         ttk.Label(of, text="Дод. прапорці:").grid(row=2, column=0, sticky="w", pady=(6, 0))
-        self.var_flags = tk.StringVar(value=self.cfg.get("flags", "--drive-chunk-size 32M"))
-        ttk.Entry(of, textvariable=self.var_flags, width=60)\
-            .grid(row=2, column=1, columnspan=3, sticky="we", padx=4, pady=(6, 0))
+        self.var_flags = tk.StringVar(value=self.cfg.get("flags", PRESET_FLAGS[0]))
+        # історія: те, з чим уже запускали, лишається у списку
+        self.flag_hist = [f for f in self.cfg.get("flags_history", []) if f.strip()]
+        for preset in PRESET_FLAGS:
+            if preset not in self.flag_hist:
+                self.flag_hist.append(preset)
+        self.cb_flags = ttk.Combobox(of, textvariable=self.var_flags, width=58,
+                                     values=self.flag_hist)
+        self.cb_flags.grid(row=2, column=1, columnspan=3, sticky="we", padx=4, pady=(6, 0))
+
+        ttk.Label(of, text="Швидкий вибір:").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        self.cb_profile = ttk.Combobox(of, width=58, state="readonly",
+                                       values=list(PROFILES.keys()))
+        self.cb_profile.grid(row=3, column=1, columnspan=2, sticky="we", padx=4, pady=(6, 0))
+        self.cb_profile.bind("<<ComboboxSelected>>", self._apply_profile)
+        ttk.Button(of, text="?  Довідка з прапорців", command=self._show_flag_help)\
+            .grid(row=3, column=3, sticky="w", padx=4, pady=(6, 0))
+
+        # пояснення до обраного профілю
+        self.lbl_profile = ttk.Label(of, text="", foreground="#555",
+                                     wraplength=900, justify="left")
+        self.lbl_profile.grid(row=4, column=0, columnspan=4, sticky="we", pady=(5, 0))
+
         of.columnconfigure(3, weight=1)
 
         # --- прогрес (у закріпленій смузі) ---
@@ -541,11 +669,32 @@ class App(tk.Tk):
 
         # --- лог ---
         lg = ttk.LabelFrame(inner, text="Журнал", padding=4)
-        self.log = tk.Text(lg, height=5, wrap="none", font=("Consolas", 9))
-        gsb = ttk.Scrollbar(lg, orient="vertical", command=self.log.yview)
-        self.log.configure(yscrollcommand=gsb.set, state="disabled")
-        gsb.pack(side="right", fill="y")
-        self.log.pack(fill="both", expand=True)
+        gwrap = ttk.Frame(lg)
+        gwrap.pack(fill="both", expand=True)
+        self.log = tk.Text(gwrap, height=5, wrap="none", font=("Consolas", 9))
+        gsb = ttk.Scrollbar(gwrap, orient="vertical", command=self.log.yview)
+        ghb = ttk.Scrollbar(gwrap, orient="horizontal", command=self.log.xview)
+        self.log.configure(yscrollcommand=gsb.set, xscrollcommand=ghb.set, state="disabled")
+        self.log.grid(row=0, column=0, sticky="nsew")
+        gsb.grid(row=0, column=1, sticky="ns")
+        ghb.grid(row=1, column=0, sticky="ew")   # довгі рядки JSON тепер можна докрутити
+        gwrap.rowconfigure(0, weight=1)
+        gwrap.columnconfigure(0, weight=1)
+
+        # Text зі state="disabled" не бере фокус, тому Ctrl+C до нього не доходить —
+        # ставимо фокус по кліку і вішаємо копіювання вручну
+        self.log.bind("<Button-1>", lambda e: self.log.focus_set())
+        for seq in ("<Control-c>", "<Control-C>", "<Control-Insert>"):
+            self.log.bind(seq, self._copy_log_sel)
+        for seq in ("<Control-a>", "<Control-A>"):
+            self.log.bind(seq, self._select_log_all)
+
+        self.log_menu = tk.Menu(self, tearoff=0)
+        self.log_menu.add_command(label="Копіювати виділене", command=self._copy_log_sel)
+        self.log_menu.add_command(label="Виділити все", command=self._select_log_all)
+        self.log_menu.add_separator()
+        self.log_menu.add_command(label="Копіювати весь журнал", command=self._copy_log_all)
+        self.log.bind("<Button-3>", self._log_menu_popup)
 
         # --- нижня панель (у закріпленій смузі) ---
         bf = ttk.Frame(bottom_fixed, padding=(8, 6))
@@ -554,6 +703,7 @@ class App(tk.Tk):
         self.btn_stop = ttk.Button(bf, text="■  Стоп", command=self._stop, state="disabled")
         self.btn_stop.pack(side="left", padx=6)
         ttk.Button(bf, text="Очистити журнал", command=self._clear_log).pack(side="right")
+        ttk.Button(bf, text="Копіювати журнал", command=self._copy_log_all).pack(side="right", padx=6)
 
         # --- РОЗКЛАДКА ---
         # Закріплена смуга внизу: її не видно в прокрутці, тому «Старт»
@@ -571,6 +721,70 @@ class App(tk.Tk):
         lg.pack(fill="x", padx=8, pady=(4, 8))
 
     # ---------------- rclone ---------------- #
+
+    def _bind_clipboard_by_keycode(self):
+        """Ctrl+C/V/X/A, які працюють і на кириличній розкладці.
+
+        Tk зіставляє прив'язку за keysym, а при кирилиці Ctrl+V дає
+        «Cyrillic_em» замість «v» — і штатна прив'язка мовчить.
+        Тому дивимось на keycode, який від розкладки не залежить.
+        Вішаємо на клас: якщо розкладка латинська, спрацює точніший
+        штатний «<Control-v>», а сюди виконання не дійде.
+        """
+        virt = {65: "<<SelectAll>>", 67: "<<Copy>>", 86: "<<Paste>>", 88: "<<Cut>>"}
+
+        def handler(e):
+            if not (e.state & 0x0004):          # без Control — не наша справа
+                return None
+            name = virt.get(e.keycode)
+            if not name:
+                return None
+            e.widget.event_generate(name)
+            return "break"
+
+        for cls in ("TEntry", "Entry", "Text", "TCombobox", "TSpinbox"):
+            self.bind_class(cls, "<Control-KeyPress>", handler, add="+")
+
+    def _apply_profile(self, _evt=None):
+        """Профіль виставляє і прапорці, і потоки — одним вибором."""
+        name = self.cb_profile.get()
+        prof = PROFILES.get(name)
+        if not prof:
+            return
+        self.var_flags.set(prof["flags"])
+        self.var_tr.set(prof["transfers"])
+        self.lbl_profile.configure(text="ⓘ  " + prof.get("note", ""))
+        self._log(f"Профіль «{name}» · потоків {prof['transfers']} · {prof['flags']}")
+
+    def _show_flag_help(self):
+        win = tk.Toplevel(self)
+        win.title("Прапорці rclone — коротка довідка")
+        win.geometry("820x520")
+        win.transient(self)
+
+        ttk.Button(win, text="Закрити", command=win.destroy).pack(side="bottom", pady=6)
+        sb = ttk.Scrollbar(win, orient="vertical")
+        sb.pack(side="right", fill="y")
+        txt = tk.Text(win, wrap="word", padx=12, pady=10,
+                      font=("Segoe UI", 9), yscrollcommand=sb.set)
+        txt.pack(fill="both", expand=True)
+        sb.configure(command=txt.yview)
+
+        txt.tag_configure("flag", font=("Consolas", 10, "bold"), foreground="#1a4a8a")
+        txt.tag_configure("body", lmargin1=18, lmargin2=18, spacing3=8)
+        for flag, desc in FLAG_HELP:
+            txt.insert("end", flag + "\n", "flag")
+            txt.insert("end", desc + "\n\n", "body")
+        txt.configure(state="disabled")
+
+    def _remember_flags(self):
+        """Кожен запущений набір прапорців лишається у випадному списку."""
+        cur = self.var_flags.get().strip()
+        if not cur:
+            return
+        self.flag_hist = ([cur] + [f for f in self.flag_hist if f != cur])[:12]
+        self.cb_flags["values"] = self.flag_hist
+        self.cfg["flags_history"] = self.flag_hist
 
     def _pick_rclone(self):
         p = filedialog.askopenfilename(title="Вкажіть rclone",
@@ -719,7 +933,7 @@ class App(tk.Tk):
             cmd.append("--dirs-only")
         r = run_capture(cmd, timeout=120)
         if r.returncode != 0:
-            raise RuntimeError((r.stderr or "").strip()[:400])
+            raise RuntimeError(rclone_error(r.stderr))
         return json.loads(r.stdout or "[]")
 
     def _expand_remote(self, _evt):
@@ -728,6 +942,16 @@ class App(tk.Tk):
     def _expand_remote_node(self, iid):
         meta = self.rmeta.get(iid)
         if not meta or meta["loaded"]:
+            return
+        # Google Drive дозволяє «\» в імені, але rclone на Windows читає його
+        # як роздільник шляху, тож така тека недосяжна інакше як за ID.
+        # Не ганяємо марний запит — одразу пояснюємо.
+        if "\\" in meta["path"]:
+            meta["loaded"] = True
+            self.rtree.delete(*self.rtree.get_children(iid))
+            self.rtree.insert(iid, "end",
+                              text="⚠ у назві теки є «\\» — rclone на Windows не може її "
+                                   "відкрити. Перейменуй теку в Google Drive.")
             return
         meta["loaded"] = True
         self.rtree.delete(*self.rtree.get_children(iid))
@@ -889,7 +1113,11 @@ class App(tk.Tk):
             return
         tree = self.rtree if which == "r" else self.ltree
         for iid in sel:
-            tree.item(iid, text=f"{self._base_label(which, iid)}   (рахую…)")
+            base = self._base_label(which, iid)
+            if which == "r" and "\\" in self.rmeta[iid]["path"]:
+                tree.item(iid, text=f"{base}   (недосяжна через «\\» в назві)")
+                continue
+            tree.item(iid, text=f"{base}   (рахую…)")
             threading.Thread(target=self._size_worker,
                              args=(which, iid, targets[iid]), daemon=True).start()
 
@@ -898,7 +1126,7 @@ class App(tk.Tk):
             # --fast-list різко зменшує кількість запитів до Drive на великих теках
             r = run_capture([self.rclone, "size", target, "--json", "--fast-list"], timeout=900)
             if r.returncode != 0:
-                raise RuntimeError((r.stderr or "").strip()[:300])
+                raise RuntimeError(rclone_error(r.stderr))
             d = json.loads(r.stdout or "{}")
             self.q.put(("rsize", (which, iid, d.get("bytes"), d.get("count"), None)))
         except Exception as e:
@@ -1025,6 +1253,7 @@ class App(tk.Tk):
                                        icon="warning"):
                 return
 
+        self._remember_flags()
         self.cfg.update({"rclone": self.rclone, "mode": mode, "overwrite": self.var_ow.get(),
                          "transfers": int(self.var_tr.get()), "flags": self.var_flags.get(),
                          "remote": self.var_remote.get()})
@@ -1131,6 +1360,36 @@ class App(tk.Tk):
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
+
+    def _to_clipboard(self, text):
+        if not text:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update_idletasks()      # щоб буфер пережив закриття вікна
+
+    def _copy_log_sel(self, _evt=None):
+        """Ctrl+C: виділене, а якщо нічого не виділено — весь журнал."""
+        try:
+            text = self.log.get("sel.first", "sel.last")
+        except tk.TclError:
+            text = ""
+        self._to_clipboard(text or self.log.get("1.0", "end-1c"))
+        return "break"
+
+    def _copy_log_all(self):
+        self._to_clipboard(self.log.get("1.0", "end-1c"))
+
+    def _select_log_all(self, _evt=None):
+        self.log.tag_add("sel", "1.0", "end-1c")
+        return "break"
+
+    def _log_menu_popup(self, e):
+        self.log.focus_set()
+        try:
+            self.log_menu.tk_popup(e.x_root, e.y_root)
+        finally:
+            self.log_menu.grab_release()
 
     def _on_close(self):
         if self.worker and self.worker.is_alive():
