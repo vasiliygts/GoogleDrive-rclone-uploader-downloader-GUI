@@ -77,8 +77,8 @@ PROFILES = {
     "Суміш · один прохід — простіше": {
         "flags": "--drive-chunk-size 32M --tpslimit 10 --tpslimit-burst 10",
         "transfers": 4,
-        "note": "Усереднені налаштування, черга проходить один раз. Бери, коли "
-                "файли приблизно однакові за розміром, коли передача невелика, "
+        "note": "Усереднені налаштування, черга проходить один раз. Підходить, "
+                "коли файли приблизно однакові за розміром, коли передача невелика, "
                 "або коли в теці ДУЖЕ багато файлів: два проходи сканували б "
                 "таке дерево двічі, і на скануванні втратилось би більше, "
                 "ніж виграється на самій передачі.",
@@ -90,8 +90,8 @@ PROFILES = {
         "two_pass": True,
         "note": "Старт проганяє чергу ДВІЧІ: спершу файли до 64 МБ дванадцятьма "
                 "потоками, потім більші — двома, великими частинами. Кожна "
-                "половина отримує свої оптимальні налаштування. Бери, коли в "
-                "теці і відео на сотні МБ, і купа дрібниці — тобто саме там, де "
+                "половина отримує свої оптимальні налаштування. Підходить, коли "
+                "в теці і відео на сотні МБ, і купа дрібниці — тобто саме там, де "
                 "усереднений набір програє обом. Ціна: дерево сканується двічі.",
     },
     # Ті самі проходи окремо — якщо потрібен контроль між ними
@@ -106,9 +106,9 @@ PROFILES = {
                  "--tpslimit 10 --tpslimit-burst 10",
         "transfers": 12,
         "note": "Половина від «двох проходів», запущена окремо: передасть лише "
-                "файли до 64 МБ, великі не чіпатиме. Потрібно, коли хочеш "
-                "контроль між проходами або поки що тільки дрібноту. Потім, "
-                "не міняючи черги, обери «тільки великі».",
+                "файли до 64 МБ, великі не чіпатиме. Знадобиться, коли потрібен "
+                "контроль між проходами або поки що лише дрібнота. Далі, "
+                "не міняючи черги, обрати «тільки великі».",
     },
     "Окремо · тільки великі (≥64 МБ)": {
         "flags": "--min-size 64M --drive-chunk-size 128M "
@@ -151,9 +151,8 @@ FLAG_HELP = [
      "потрапляють під фільтри за розміром."),
 ]
 
-# ці набори завжди присутні у випадному списку прапорців
-# (порожній рядок профілю «обидва проходи» сюди не потрапляє)
-PRESET_FLAGS = [p["flags"] for p in PROFILES.values() if p["flags"]]
+# чим заповнене поле прапорців до першого вибору типу передачі
+DEFAULT_FLAGS = PROFILES["Суміш · один прохід — простіше"]["flags"]
 
 # з чого складається профіль «обидва проходи»
 TWO_PASS = [
@@ -430,7 +429,7 @@ class RcloneWorker(threading.Thread):
                             self.emit("log",
                                       "    ↳ Якщо призначення — корінь теки «Комп'ютери», "
                                       "Google не дозволяє створювати там нові теки. "
-                                      "Обери призначенням наявну теку рівнем нижче.")
+                                      "Призначенням треба обрати наявну теку рівнем нижче.")
                     elif msg:
                         self.emit("log", msg)
             else:
@@ -456,6 +455,7 @@ class App(tk.Tk):
         super().__init__()
         self.title(APP_NAME)
         self.cfg = load_cfg()
+        self.cfg.pop("flags_history", None)   # історія прапорців більше не ведеться
 
         # розмір вікна: збережений з минулого разу, інакше підганяємо під екран
         # (на 1536x864 стандартні 780 не влазили — кнопки «Старт/Стоп» виїжджали)
@@ -678,21 +678,15 @@ class App(tk.Tk):
         ttk.Button(of, text="?  Довідка з прапорців", command=self._show_flag_help)\
             .grid(row=2, column=3, sticky="w", padx=4, pady=(8, 0))
 
-        self.lbl_profile = ttk.Label(of, text="Обери тип передачі — він підбере "
-                                               "прапорці й кількість потоків",
+        self.lbl_profile = ttk.Label(of, text="Тип передачі підбирає прапорці "
+                                               "й кількість потоків",
                                      foreground="#555", wraplength=900, justify="left")
         self.lbl_profile.grid(row=3, column=0, columnspan=4, sticky="we", pady=(4, 0))
 
         ttk.Label(of, text="Дод. прапорці:").grid(row=4, column=0, sticky="w", pady=(6, 0))
-        self.var_flags = tk.StringVar(value=self.cfg.get("flags", PRESET_FLAGS[0]))
-        # історія: те, з чим уже запускали, лишається у списку
-        self.flag_hist = [f for f in self.cfg.get("flags_history", []) if f.strip()]
-        for preset in PRESET_FLAGS:
-            if preset not in self.flag_hist:
-                self.flag_hist.append(preset)
-        self.cb_flags = ttk.Combobox(of, textvariable=self.var_flags, width=58,
-                                     values=self.flag_hist)
-        self.cb_flags.grid(row=4, column=1, columnspan=3, sticky="we", padx=4, pady=(6, 0))
+        self.var_flags = tk.StringVar(value=self.cfg.get("flags", DEFAULT_FLAGS))
+        self.ent_flags = ttk.Entry(of, textvariable=self.var_flags, width=60)
+        self.ent_flags.grid(row=4, column=1, columnspan=3, sticky="we", padx=4, pady=(6, 0))
 
         of.columnconfigure(3, weight=1)
 
@@ -798,18 +792,18 @@ class App(tk.Tk):
         if self._two_pass:
             # прапорці й потоки задають самі проходи — щоб не збивати з пантелику,
             # вимикаємо поля й кажемо на кнопці, що запусків буде два
-            self.cb_flags.configure(state="disabled")
+            self.ent_flags.configure(state="disabled")
             self.sp_tr.configure(state="disabled")
             self.btn_start.configure(text="▶  Старт (2 проходи)")
-            self._log(f"Профіль «{name}» · Старт прожене чергу двічі")
+            self._log(f"Тип передачі «{name}» · Старт прожене чергу двічі")
             return
 
-        self.cb_flags.configure(state="normal")
+        self.ent_flags.configure(state="normal")
         self.sp_tr.configure(state="normal")
         self.btn_start.configure(text="▶  Старт")
         self.var_flags.set(prof["flags"])
         self.var_tr.set(prof["transfers"])
-        self._log(f"Профіль «{name}» · потоків {prof['transfers']} · {prof['flags']}")
+        self._log(f"Тип передачі «{name}» · потоків {prof['transfers']} · {prof['flags']}")
 
     def _show_flag_help(self):
         win = tk.Toplevel(self)
@@ -831,15 +825,6 @@ class App(tk.Tk):
             txt.insert("end", flag + "\n", "flag")
             txt.insert("end", desc + "\n\n", "body")
         txt.configure(state="disabled")
-
-    def _remember_flags(self):
-        """Кожен запущений набір прапорців лишається у випадному списку."""
-        cur = self.var_flags.get().strip()
-        if not cur:
-            return
-        self.flag_hist = ([cur] + [f for f in self.flag_hist if f != cur])[:12]
-        self.cb_flags["values"] = self.flag_hist
-        self.cfg["flags_history"] = self.flag_hist
 
     def _pick_rclone(self):
         p = filedialog.askopenfilename(title="Вкажіть rclone",
@@ -863,8 +848,9 @@ class App(tk.Tk):
     def _check_rclone(self):
         exe = self.var_rclone.get().strip()
         if not exe or not (Path(exe).exists() or shutil.which(exe)):
-            self._log("rclone не знайдено. Встанови його (winget install Rclone.Rclone), "
-                      "поклади rclone.exe поруч зі скриптом або вкажи шлях кнопкою «…».")
+            self._log("rclone не знайдено. Його треба встановити "
+                      "(winget install Rclone.Rclone), покласти rclone.exe поруч зі "
+                      "скриптом або вказати шлях кнопкою «…».")
             self._load_local_roots()  # локальне дерево від rclone не залежить
             return
         self.rclone = exe
@@ -894,8 +880,9 @@ class App(tk.Tk):
                               f"   (файл {'на місці' if Path(path).exists() else 'ВІДСУТНІЙ'})")
             except Exception:
                 pass
-            self._log("Немає жодного налаштованого remote. Натисни «⚙ rclone config» "
-                      "→ n → ім'я (напр. gdrive) → drive → далі за майстром.")
+            self._log("Немає жодного налаштованого remote. Створити можна кнопкою "
+                      "«⚙ rclone config»: n → ім'я (напр. gdrive) → drive → "
+                      "далі за майстром.")
         self._load_local_roots()
 
     # ---------------- локальне дерево ---------------- #
@@ -1006,7 +993,7 @@ class App(tk.Tk):
             self.rtree.delete(*self.rtree.get_children(iid))
             self.rtree.insert(iid, "end",
                               text="⚠ у назві теки є «\\» — rclone на Windows не може її "
-                                   "відкрити. Перейменуй теку в Google Drive.")
+                                   "відкрити. Таку теку треба перейменувати в Google Drive.")
             return
         meta["loaded"] = True
         self.rtree.delete(*self.rtree.get_children(iid))
@@ -1154,13 +1141,13 @@ class App(tk.Tk):
         sel = [i for i in self.rtree.selection()
                if i in self.rmeta and self.rmeta[i].get("dir")]
         self._start_size("r", sel, {i: prefix + self.rmeta[i]["path"] for i in sel},
-                         "Виділи справа одну або кілька тек.")
+                         "Треба виділити справа одну або кілька тек.")
 
     def _calc_local_size(self):
         sel = [i for i in self.ltree.selection()
                if i in self.lmeta and self.lmeta[i].get("dir")]
         self._start_size("l", sel, {i: self.lmeta[i]["path"] for i in sel},
-                         "Виділи зліва одну або кілька тек.")
+                         "Треба виділити зліва одну або кілька тек.")
 
     def _start_size(self, which, sel, targets, empty_msg):
         if not sel:
@@ -1222,11 +1209,13 @@ class App(tk.Tk):
     def _queue_upload(self):
         srcs = [self.lmeta[i] for i in self.ltree.selection() if i in self.lmeta]
         if not srcs:
-            messagebox.showinfo(APP_NAME, "Виділи зліва папки/файли для вивантаження.")
+            messagebox.showinfo(APP_NAME, "Треба виділити зліва папки або файли "
+                                          "для вивантаження.")
             return
         dst = self._sel_dest_remote()
         if dst is None:
-            messagebox.showinfo(APP_NAME, "Виділи справа теку призначення в хмарі.")
+            messagebox.showinfo(APP_NAME, "Треба виділити справа теку призначення "
+                                          "в хмарі.")
             return
         for m in srcs:
             name = Path(m["path"]).name or m["path"].replace("\\", "").replace(":", "")
@@ -1236,11 +1225,13 @@ class App(tk.Tk):
         srcs = [self.rmeta[i] for i in self.rtree.selection() if i in self.rmeta]
         srcs = [m for m in srcs if m.get("path")]
         if not srcs:
-            messagebox.showinfo(APP_NAME, "Виділи справа папки/файли для завантаження.")
+            messagebox.showinfo(APP_NAME, "Треба виділити справа папки або файли "
+                                          "для завантаження.")
             return
         dst = self._sel_dest_local()
         if dst is None:
-            messagebox.showinfo(APP_NAME, "Виділи зліва локальну теку призначення.")
+            messagebox.showinfo(APP_NAME, "Треба виділити зліва локальну теку "
+                                          "призначення.")
             return
         for m in srcs:
             self._add_job(Job(self._remote_prefix() + m["path"], dst,
@@ -1268,7 +1259,7 @@ class App(tk.Tk):
                 APP_NAME,
                 "Черга порожня — рахувати нічого.\n\n"
                 "Ця кнопка рахує обсяг ЧЕРГИ. Щоб дізнатися розмір окремої теки, "
-                "виділи її в дереві й натисни «Σ Розмір теки» над цим деревом.")
+                "її треба виділити в дереві й натиснути «Σ Розмір теки» над цим деревом.")
             return
         self._log("Рахую обсяг черги…")
 
@@ -1314,7 +1305,6 @@ class App(tk.Tk):
                           for short, n in TWO_PASS]
             else:                                # звичайний запуск — один прохід
                 passes = [("", self.var_flags.get().strip(), int(self.var_tr.get()))]
-                self._remember_flags()
 
         self.cfg.update({"rclone": self.rclone, "mode": mode, "overwrite": self.var_ow.get(),
                          "transfers": int(self.var_tr.get()), "flags": self.var_flags.get(),
@@ -1409,7 +1399,8 @@ class App(tk.Tk):
         self._log(msg)
         if self.var_dry.get():
             self._log("Це був DRY-RUN — реальних змін не зроблено. "
-                      "Зніми галочку і натисни «Старт» ще раз.")
+                      "Щоб виконати насправді, треба зняти галочку "
+                      "й натиснути «Старт» ще раз.")
 
     # ---------------- дрібниці ---------------- #
 
