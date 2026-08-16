@@ -74,33 +74,49 @@ PROFILES = {
                 "Розмір частини не важить: файли й так менші за поріг 8 МіБ. "
                 "--fast-list пришвидшує сканування дерева.",
     },
-    "Суміш (універсальний)": {
+    "Суміш · один прохід — простіше": {
         "flags": "--drive-chunk-size 32M --tpslimit 10 --tpslimit-burst 10",
         "transfers": 4,
-        "note": "Компроміс, коли ліньки розбивати на два проходи. "
-                "Працює прийнятно скрізь, але поступається парі проходів "
-                "на теках зі змішаним вмістом.",
+        "note": "Усереднені налаштування, черга проходить один раз. Бери, коли "
+                "файли приблизно однакові за розміром, коли передача невелика, "
+                "або коли в теці ДУЖЕ багато файлів: два проходи сканували б "
+                "таке дерево двічі, і на скануванні втратилось би більше, "
+                "ніж виграється на самій передачі.",
     },
+    # Один пункт, який сам робить обидва проходи: Старт проганяє чергу двічі.
+    "Суміш · два проходи — швидше": {
+        "flags": "",
+        "transfers": 0,
+        "two_pass": True,
+        "note": "Старт проганяє чергу ДВІЧІ: спершу файли до 64 МБ дванадцятьма "
+                "потоками, потім більші — двома, великими частинами. Кожна "
+                "половина отримує свої оптимальні налаштування. Бери, коли в "
+                "теці і відео на сотні МБ, і купа дрібниці — тобто саме там, де "
+                "усереднений набір програє обом. Ціна: дерево сканується двічі.",
+    },
+    # Ті самі проходи окремо — якщо потрібен контроль між ними
+    # або треба прогнати лише одну частину файлів.
     # Два проходи по тій самій парі «джерело → призначення»: спершу дрібні
     # з високим паралелізмом, потім великі з великими частинами. На змішаних
     # теках це помітно швидше за будь-який усереднений набір.
     # Файл рівно 64 МБ підпадає під обидва фільтри, але другий прохід
     # побачить його вже завантаженим і пропустить.
-    "Суміш · прохід 1 — дрібні (≤64 МБ)": {
+    "Окремо · тільки дрібні (≤64 МБ)": {
         "flags": "--max-size 64M --drive-chunk-size 16M --fast-list "
                  "--tpslimit 10 --tpslimit-burst 10",
         "transfers": 12,
-        "note": "Перший з двох проходів по ТІЙ САМІЙ черзі. Бере лише файли "
-                "до 64 МБ і жене їх дванадцятьма потоками. Далі, не міняючи "
-                "черги, вибери прохід 2.",
+        "note": "Половина від «двох проходів», запущена окремо: передасть лише "
+                "файли до 64 МБ, великі не чіпатиме. Потрібно, коли хочеш "
+                "контроль між проходами або поки що тільки дрібноту. Потім, "
+                "не міняючи черги, обери «тільки великі».",
     },
-    "Суміш · прохід 2 — великі (≥64 МБ)": {
+    "Окремо · тільки великі (≥64 МБ)": {
         "flags": "--min-size 64M --drive-chunk-size 128M "
                  "--tpslimit 10 --tpslimit-burst 10",
         "transfers": 2,
-        "note": "Другий прохід: тільки файли від 64 МБ, двома потоками. "
-                "Черга та сама, переформовувати не треба — фільтр сам "
-                "відбере потрібне. Порядок проходів неважливий.",
+        "note": "Друга половина, окремо: тільки файли від 64 МБ, двома потоками. "
+                "Черга та сама, переформовувати не треба — фільтр сам відбере "
+                "потрібне. Порядок неважливий, можна почати й з великих.",
     },
 }
 
@@ -136,7 +152,14 @@ FLAG_HELP = [
 ]
 
 # ці набори завжди присутні у випадному списку прапорців
-PRESET_FLAGS = [p["flags"] for p in PROFILES.values()]
+# (порожній рядок профілю «обидва проходи» сюди не потрапляє)
+PRESET_FLAGS = [p["flags"] for p in PROFILES.values() if p["flags"]]
+
+# з чого складається профіль «обидва проходи»
+TWO_PASS = [
+    ("прохід 1 · дрібні",  "Окремо · тільки дрібні (≤64 МБ)"),
+    ("прохід 2 · великі",  "Окремо · тільки великі (≥64 МБ)"),
+]
 
 
 # --------------------------------------------------------------------------- #
@@ -283,15 +306,19 @@ class Job:
 # --------------------------------------------------------------------------- #
 
 class RcloneWorker(threading.Thread):
-    def __init__(self, rclone, jobs, mode, overwrite, dry_run, extra_flags, transfers, out_q):
+    def __init__(self, rclone, jobs, mode, overwrite, dry_run, passes, out_q):
+        """passes — список (підпис, прапорці, потоки).
+
+        Звичайний запуск подає один прохід, кнопка «Обидва проходи» — два:
+        ту саму чергу проганяємо двічі з різними фільтрами за розміром.
+        """
         super().__init__(daemon=True)
         self.rclone = rclone
         self.jobs = jobs
         self.mode = mode
         self.overwrite = overwrite
         self.dry_run = dry_run
-        self.extra_flags = extra_flags
-        self.transfers = transfers
+        self.passes = passes
         self.q = out_q
         self.proc = None
         self._stop = threading.Event()
@@ -307,7 +334,7 @@ class RcloneWorker(threading.Thread):
     def emit(self, kind, payload):
         self.q.put((kind, payload))
 
-    def build_cmd(self, job: Job):
+    def build_cmd(self, job: Job, flags: str, transfers: int):
         mode = self.mode
         # sync для одиничного файлу небезпечний/некоректний -> зводимо до copy
         if mode == "sync" and not job.is_dir:
@@ -318,8 +345,8 @@ class RcloneWorker(threading.Thread):
             "--use-json-log",
             "--stats", "1s",
             "--stats-log-level", "NOTICE",
-            "--transfers", str(self.transfers),
-            "--checkers", str(max(4, self.transfers * 2)),
+            "--transfers", str(transfers),
+            "--checkers", str(max(4, transfers * 2)),
             "--retries", "3",
             "--low-level-retries", "10",
             "-v",
@@ -330,83 +357,94 @@ class RcloneWorker(threading.Thread):
             cmd.append("--ignore-existing")
         if self.dry_run:
             cmd.append("--dry-run")
-        cmd += split_flags(self.extra_flags)
+        cmd += split_flags(flags)
         return cmd
 
     def run(self):
-        total = len(self.jobs)
+        total = len(self.jobs) * len(self.passes)
         errors = 0
         started = time.time()
+        idx = 0
 
-        for idx, job in enumerate(self.jobs, 1):
+        for label, flags, transfers in self.passes:
             if self._stop.is_set():
                 break
+            if label:
+                self.emit("log", f"───  {label}  ·  потоків {transfers}  ·  {flags}")
 
-            cmd = self.build_cmd(job)
-            self.emit("job", {"index": idx, "total": total, "job": job,
-                              "dst": job.dst_full(self.mode)})
-            self.emit("log", "$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd))
-
-            try:
-                self.proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    bufsize=1,
-                    creationflags=NOWIN,
-                )
-            except Exception as e:
-                errors += 1
-                self.emit("log", f"[ПОМИЛКА ЗАПУСКУ] {e}")
-                continue
-
-            for line in self.proc.stderr:
+            for job in self.jobs:
                 if self._stop.is_set():
                     break
-                line = line.strip()
-                if not line:
-                    continue
-                if line.startswith("{"):
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        self.emit("log", line)
-                        continue
-                    stats = obj.get("stats")
-                    if stats:
-                        self.emit("stats", stats)
-                    else:
-                        msg = obj.get("msg", "").strip()
-                        lvl = obj.get("level", "")
-                        if msg and lvl in ("error", "warning", "notice"):
-                            self.emit("log", f"[{lvl}] {msg}")
-                            # Google віддає голий 400 на спробу створити теку
-                            # в корені розділу «Комп'ютери» — підкажемо, що робити
-                            if "badRequest" in msg and "make directory" in msg:
-                                self.emit("log",
-                                          "    ↳ Якщо призначення — корінь теки «Комп'ютери», "
-                                          "Google не дозволяє створювати там нові теки. "
-                                          "Обери призначенням наявну теку рівнем нижче.")
-                        elif msg:
-                            self.emit("log", msg)
-                else:
-                    self.emit("log", line)
-
-            rc = self.proc.wait()
-            if self._stop.is_set():
-                self.emit("log", f"[×] Перервано: {job.name}")
-            elif rc != 0:
-                errors += 1
-                self.emit("log", f"[!] Завдання «{job.name}» завершилось з кодом {rc}")
-            else:
-                self.emit("log", f"[✓] Готово: {job.name}")
+                idx += 1
+                cmd = self.build_cmd(job, flags, transfers)
+                self.emit("job", {"index": idx, "total": total, "job": job,
+                                  "dst": job.dst_full(self.mode), "pass": label})
+                self.emit("log", "$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd))
+                if not self._run_one(job, cmd):
+                    errors += 1
 
         self.emit("done", {"errors": errors,
                            "cancelled": self._stop.is_set(),
                            "elapsed": time.time() - started})
+
+    def _run_one(self, job: Job, cmd) -> bool:
+        """Один запуск rclone: читає вивід до кінця. True — без помилки."""
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=NOWIN,
+            )
+        except Exception as e:
+            self.emit("log", f"[ПОМИЛКА ЗАПУСКУ] {e}")
+            return False
+
+        for line in self.proc.stderr:
+            if self._stop.is_set():
+                break
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("{"):
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    self.emit("log", line)
+                    continue
+                stats = obj.get("stats")
+                if stats:
+                    self.emit("stats", stats)
+                else:
+                    msg = obj.get("msg", "").strip()
+                    lvl = obj.get("level", "")
+                    if msg and lvl in ("error", "warning", "notice"):
+                        self.emit("log", f"[{lvl}] {msg}")
+                        # Google віддає голий 400 на спробу створити теку
+                        # в корені розділу «Комп'ютери» — підкажемо, що робити
+                        if "badRequest" in msg and "make directory" in msg:
+                            self.emit("log",
+                                      "    ↳ Якщо призначення — корінь теки «Комп'ютери», "
+                                      "Google не дозволяє створювати там нові теки. "
+                                      "Обери призначенням наявну теку рівнем нижче.")
+                    elif msg:
+                        self.emit("log", msg)
+            else:
+                self.emit("log", line)
+
+        rc = self.proc.wait()
+        if self._stop.is_set():
+            self.emit("log", f"[×] Перервано: {job.name}")
+            return True                      # скасування — не помилка
+        if rc != 0:
+            self.emit("log", f"[!] Завдання «{job.name}» завершилось з кодом {rc}")
+            return False
+        self.emit("log", f"[✓] Готово: {job.name}")
+        return True
 
 
 # --------------------------------------------------------------------------- #
@@ -433,6 +471,7 @@ class App(tk.Tk):
         self.worker = None
         self.jobs = []
         self._job_pos = (0, 0)   # (поточне завдання, усього) — для відсотка в заголовку
+        self._two_pass = False   # профіль «обидва проходи» — Старт жене чергу двічі
 
         # мапа iid -> метадані вузлів дерев
         self.lmeta = {}
@@ -626,10 +665,25 @@ class App(tk.Tk):
 
         ttk.Label(of, text="Потоків:").grid(row=1, column=2, sticky="w", padx=(14, 0), pady=(6, 0))
         self.var_tr = tk.IntVar(value=self.cfg.get("transfers", 4))
-        ttk.Spinbox(of, from_=1, to=16, width=5, textvariable=self.var_tr)\
-            .grid(row=1, column=3, sticky="w", padx=4, pady=(6, 0))
+        self.sp_tr = ttk.Spinbox(of, from_=1, to=16, width=5, textvariable=self.var_tr)
+        self.sp_tr.grid(row=1, column=3, sticky="w", padx=4, pady=(6, 0))
 
-        ttk.Label(of, text="Дод. прапорці:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        # Профіль стоїть НАД прапорцями: він їх і заповнює, тож читається
+        # згори вниз — вибір типу передачі, пояснення, отримані прапорці.
+        ttk.Label(of, text="Тип передачі:").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.cb_profile = ttk.Combobox(of, width=58, state="readonly",
+                                       values=list(PROFILES.keys()))
+        self.cb_profile.grid(row=2, column=1, columnspan=2, sticky="we", padx=4, pady=(8, 0))
+        self.cb_profile.bind("<<ComboboxSelected>>", self._apply_profile)
+        ttk.Button(of, text="?  Довідка з прапорців", command=self._show_flag_help)\
+            .grid(row=2, column=3, sticky="w", padx=4, pady=(8, 0))
+
+        self.lbl_profile = ttk.Label(of, text="Обери тип передачі — він підбере "
+                                               "прапорці й кількість потоків",
+                                     foreground="#555", wraplength=900, justify="left")
+        self.lbl_profile.grid(row=3, column=0, columnspan=4, sticky="we", pady=(4, 0))
+
+        ttk.Label(of, text="Дод. прапорці:").grid(row=4, column=0, sticky="w", pady=(6, 0))
         self.var_flags = tk.StringVar(value=self.cfg.get("flags", PRESET_FLAGS[0]))
         # історія: те, з чим уже запускали, лишається у списку
         self.flag_hist = [f for f in self.cfg.get("flags_history", []) if f.strip()]
@@ -638,20 +692,7 @@ class App(tk.Tk):
                 self.flag_hist.append(preset)
         self.cb_flags = ttk.Combobox(of, textvariable=self.var_flags, width=58,
                                      values=self.flag_hist)
-        self.cb_flags.grid(row=2, column=1, columnspan=3, sticky="we", padx=4, pady=(6, 0))
-
-        ttk.Label(of, text="Швидкий вибір:").grid(row=3, column=0, sticky="w", pady=(6, 0))
-        self.cb_profile = ttk.Combobox(of, width=58, state="readonly",
-                                       values=list(PROFILES.keys()))
-        self.cb_profile.grid(row=3, column=1, columnspan=2, sticky="we", padx=4, pady=(6, 0))
-        self.cb_profile.bind("<<ComboboxSelected>>", self._apply_profile)
-        ttk.Button(of, text="?  Довідка з прапорців", command=self._show_flag_help)\
-            .grid(row=3, column=3, sticky="w", padx=4, pady=(6, 0))
-
-        # пояснення до обраного профілю
-        self.lbl_profile = ttk.Label(of, text="", foreground="#555",
-                                     wraplength=900, justify="left")
-        self.lbl_profile.grid(row=4, column=0, columnspan=4, sticky="we", pady=(5, 0))
+        self.cb_flags.grid(row=4, column=1, columnspan=3, sticky="we", padx=4, pady=(6, 0))
 
         of.columnconfigure(3, weight=1)
 
@@ -751,9 +792,23 @@ class App(tk.Tk):
         prof = PROFILES.get(name)
         if not prof:
             return
+        self._two_pass = bool(prof.get("two_pass"))
+        self.lbl_profile.configure(text="ⓘ  " + prof.get("note", ""))
+
+        if self._two_pass:
+            # прапорці й потоки задають самі проходи — щоб не збивати з пантелику,
+            # вимикаємо поля й кажемо на кнопці, що запусків буде два
+            self.cb_flags.configure(state="disabled")
+            self.sp_tr.configure(state="disabled")
+            self.btn_start.configure(text="▶  Старт (2 проходи)")
+            self._log(f"Профіль «{name}» · Старт прожене чергу двічі")
+            return
+
+        self.cb_flags.configure(state="normal")
+        self.sp_tr.configure(state="normal")
+        self.btn_start.configure(text="▶  Старт")
         self.var_flags.set(prof["flags"])
         self.var_tr.set(prof["transfers"])
-        self.lbl_profile.configure(text="ⓘ  " + prof.get("note", ""))
         self._log(f"Профіль «{name}» · потоків {prof['transfers']} · {prof['flags']}")
 
     def _show_flag_help(self):
@@ -1233,7 +1288,7 @@ class App(tk.Tk):
 
     # ---------------- запуск ---------------- #
 
-    def _start(self):
+    def _start(self, passes=None):
         if self.worker and self.worker.is_alive():
             return
         if not self.jobs:
@@ -1253,7 +1308,14 @@ class App(tk.Tk):
                                        icon="warning"):
                 return
 
-        self._remember_flags()
+        if passes is None:
+            if self._two_pass:                   # профіль «обидва проходи»
+                passes = [(short, PROFILES[n]["flags"], PROFILES[n]["transfers"])
+                          for short, n in TWO_PASS]
+            else:                                # звичайний запуск — один прохід
+                passes = [("", self.var_flags.get().strip(), int(self.var_tr.get()))]
+                self._remember_flags()
+
         self.cfg.update({"rclone": self.rclone, "mode": mode, "overwrite": self.var_ow.get(),
                          "transfers": int(self.var_tr.get()), "flags": self.var_flags.get(),
                          "remote": self.var_remote.get()})
@@ -1264,11 +1326,11 @@ class App(tk.Tk):
         self.pb["value"] = 0
         self._log("=" * 70)
         self._log(f"СТАРТ · режим={mode} · перезапис={self.var_ow.get()} · "
-                  f"dry-run={'ТАК' if self.var_dry.get() else 'ні'}")
+                  f"dry-run={'ТАК' if self.var_dry.get() else 'ні'}"
+                  + (f" · проходів: {len(passes)}" if len(passes) > 1 else ""))
 
         self.worker = RcloneWorker(self.rclone, list(self.jobs), mode, self.var_ow.get(),
-                                   self.var_dry.get(), self.var_flags.get().strip(),
-                                   int(self.var_tr.get()), self.q)
+                                   self.var_dry.get(), passes, self.q)
         self.worker.start()
 
     def _stop(self):
@@ -1291,8 +1353,9 @@ class App(tk.Tk):
                 elif kind == "job":
                     j = payload["job"]
                     self._job_pos = (payload["index"], payload["total"])
+                    tag = f"{payload['pass']} · " if payload.get("pass") else ""
                     self.lbl_job.configure(
-                        text=f"[{payload['index']}/{payload['total']}] "
+                        text=f"[{payload['index']}/{payload['total']}] {tag}"
                              f"{'⬆' if j.direction == 'up' else '⬇'} {j.src}  →  {payload['dst']}")
                     self.pb["value"] = 0
                 elif kind == "stats":
