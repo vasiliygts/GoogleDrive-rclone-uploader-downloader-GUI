@@ -14,6 +14,7 @@ rclone
 # містять імена файлів, а серед них трапляються паролі й чужі адреси
 zero_files.txt
 zero_mp4.txt
+big_files.txt
 
 # --- службове ---
 __pycache__/

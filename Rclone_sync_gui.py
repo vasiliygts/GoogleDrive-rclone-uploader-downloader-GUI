@@ -18,6 +18,7 @@ RcloneSync GUI - візуальна оболонка над rclone для Google
 import json
 import os
 import queue
+import re
 import shlex
 import shutil
 import string
@@ -203,6 +204,74 @@ def rclone_error(stderr: str, limit: int = 300) -> str:
             pick = pick.split(tag, 1)[1].strip()
             break
     return pick[:limit]
+
+
+def sane_geometry(geo: str, sw: int, sh: int) -> str:
+    """Відкидає збережену позицію, якщо вікно опинилося б поза екраном.
+
+    Класичний випадок — від'єднали другий монітор: вікно є в панелі задач,
+    але на екрані його не видно й дістати важко. Розмір лишаємо, позицію
+    віддаємо системі.
+    """
+    m = re.match(r"^(\d+)x(\d+)([+-])(-?\d+)([+-])(-?\d+)$", (geo or "").strip())
+    if not m:
+        return ""        # порожнє або зіпсоване — хай спрацює типовий розмір
+    w, h = int(m.group(1)), int(m.group(2))
+    w, h = min(w, sw), min(h, sh)
+    sx, vx = m.group(3), int(m.group(4))
+    sy, vy = m.group(5), int(m.group(6))
+    # «-» у Tk означає відступ від правого/нижнього краю
+    left = vx if sx == "+" else sw - w - vx
+    top = vy if sy == "+" else sh - h - vy
+    visible = 120           # стільки пікселів вікна має лишатись на екрані
+    if left < visible - w or top < visible - h or left > sw - visible or top > sh - visible:
+        return f"{w}x{h}"
+    return f"{w}x{h}{sx}{vx}{sy}{vy}"
+
+
+def send_to_recycle_bin(paths):
+    """Переносить локальні шляхи в Кошик Windows.
+
+    У stdlib такого немає: os.remove і shutil.rmtree видаляють назовсім.
+    Тому йдемо через SHFileOperationW із прапорцем FOF_ALLOWUNDO —
+    саме так це робить провідник.
+    Повертає (код, чи_перервано); нуль означає успіх.
+    """
+    if os.name != "nt":
+        raise RuntimeError("Кошик підтримується лише на Windows")
+
+    import ctypes
+    from ctypes import wintypes
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", wintypes.HWND),
+            ("wFunc", wintypes.UINT),
+            ("pFrom", wintypes.LPCWSTR),
+            ("pTo", wintypes.LPCWSTR),
+            ("fFlags", ctypes.c_uint16),
+            ("fAnyOperationsAborted", wintypes.BOOL),
+            ("hNameMappings", ctypes.c_void_p),
+            ("lpszProgressTitle", wintypes.LPCWSTR),
+        ]
+
+    FO_DELETE = 3
+    FOF_SILENT = 0x0004
+    FOF_NOCONFIRMATION = 0x0010
+    FOF_ALLOWUNDO = 0x0040          # без нього видаляє повз кошик
+    FOF_NOERRORUI = 0x0400
+
+    # список шляхів має бути з подвійним нулем у кінці
+    buf = "\0".join(os.path.abspath(p) for p in paths) + "\0\0"
+
+    op = SHFILEOPSTRUCTW()
+    op.hwnd = None
+    op.wFunc = FO_DELETE
+    op.pFrom = buf
+    op.pTo = None
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
+    rc = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    return rc, bool(op.fAnyOperationsAborted)
 
 
 def split_flags(s: str) -> list:
@@ -460,8 +529,9 @@ class App(tk.Tk):
         # розмір вікна: збережений з минулого разу, інакше підганяємо під екран
         # (на 1536x864 стандартні 780 не влазили — кнопки «Старт/Стоп» виїжджали)
         sh = self.winfo_screenheight()
-        self.geometry(self.cfg.get("geometry")
-                      or f"1180x{min(820, max(520, sh - 90))}")
+        saved = sane_geometry(self.cfg.get("geometry", ""),
+                              self.winfo_screenwidth(), sh)
+        self.geometry(saved or f"1180x{min(820, max(520, sh - 90))}")
         self.minsize(900, 480)
         saved = (self.cfg.get("rclone") or "").strip()
         # збережений шлях міг протухнути (перенесли теку) — тоді шукаємо заново
@@ -555,6 +625,7 @@ class App(tk.Tk):
         ttk.Button(lbar, text="⟳", width=3, command=self._refresh_local_node).pack(side="left")
         ttk.Button(lbar, text="Додати теку…", command=self._add_local_root).pack(side="left", padx=4)
         ttk.Button(lbar, text="Σ Розмір теки", command=self._calc_local_size).pack(side="left")
+        ttk.Button(lbar, text="🗑 Видалити", command=self._delete_local).pack(side="left", padx=4)
         self.var_showfiles_l = tk.BooleanVar(value=True)
         ttk.Checkbutton(lbar, text="файли", variable=self.var_showfiles_l,
                         command=self._load_local_roots).pack(side="left", padx=6)
@@ -573,6 +644,10 @@ class App(tk.Tk):
         lwrap.columnconfigure(0, weight=1)
         self.ltree.column("#0", width=420, minwidth=200, stretch=True)
         self.ltree.bind("<<TreeviewOpen>>", self._expand_local)
+        self.ltree.bind("<<TreeviewSelect>>", lambda e: self._update_selection("l"))
+
+        self.lbl_lsel = ttk.Label(lf, text="Виділено: —", foreground="#555", anchor="w")
+        self.lbl_lsel.pack(fill="x", pady=(3, 0))
 
         # віддалене
         rf = ttk.LabelFrame(panes, text="Google Drive / remote", padding=4)
@@ -583,6 +658,7 @@ class App(tk.Tk):
         ttk.Button(rbar, text="⟳", width=3, command=self._refresh_remote_node).pack(side="left")
         ttk.Button(rbar, text="＋ Нова тека", command=self._mkdir_remote).pack(side="left", padx=4)
         ttk.Button(rbar, text="Σ Розмір теки", command=self._calc_remote_size).pack(side="left")
+        ttk.Button(rbar, text="🗑 Видалити", command=self._delete_remote).pack(side="left", padx=4)
         self.var_showfiles_r = tk.BooleanVar(value=True)
         ttk.Checkbutton(rbar, text="файли", variable=self.var_showfiles_r,
                         command=self._load_remote_root).pack(side="left", padx=6)
@@ -600,6 +676,10 @@ class App(tk.Tk):
         rwrap.columnconfigure(0, weight=1)
         self.rtree.column("#0", width=420, minwidth=200, stretch=True)
         self.rtree.bind("<<TreeviewOpen>>", self._expand_remote)
+        self.rtree.bind("<<TreeviewSelect>>", lambda e: self._update_selection("r"))
+
+        self.lbl_rsel = ttk.Label(rf, text="Виділено: —", foreground="#555", anchor="w")
+        self.lbl_rsel.pack(fill="x", pady=(3, 0))
 
         # --- смужка зміни висоти дерев (тягнути мишею вгору/вниз) ---
         grip = tk.Frame(inner, height=7, bg="#b0b0b0", cursor="sb_v_double_arrow")
@@ -940,9 +1020,18 @@ class App(tk.Tk):
                 continue
             if not isdir and not self.var_showfiles_l.get():
                 continue
+            size = None
+            if not isdir:
+                try:
+                    size = p.stat().st_size
+                except OSError:
+                    pass
             label = ("📁 " if isdir else "📄 ") + p.name
+            if size is not None:
+                label += f"   ({human(size)})"
             child = self.ltree.insert(iid, "end", text=label)
-            self.lmeta[child] = {"path": str(p), "dir": isdir, "loaded": not isdir}
+            self.lmeta[child] = {"path": str(p), "dir": isdir,
+                                 "loaded": not isdir, "size": size}
             if isdir:
                 self.ltree.insert(child, "end", text="…")
             shown += 1
@@ -1029,11 +1118,14 @@ class App(tk.Tk):
         for it in items:
             isdir = bool(it.get("IsDir"))
             name = it.get("Name", "")
-            size = "" if isdir else f"   ({human(it.get('Size'))})"
-            label = ("📁 " if isdir else "📄 ") + name + size
+            size = None if isdir else it.get("Size")
+            label = ("📁 " if isdir else "📄 ") + name
+            if size is not None:
+                label += f"   ({human(size)})"
             child = self.rtree.insert(iid, "end", text=label)
             full = f"{base}/{name}" if base else name
-            self.rmeta[child] = {"path": full, "dir": isdir, "loaded": not isdir, "name": name}
+            self.rmeta[child] = {"path": full, "dir": isdir, "loaded": not isdir,
+                                 "name": name, "size": size}
             if isdir:
                 self.rtree.insert(child, "end", text="…")
 
@@ -1123,6 +1215,138 @@ class App(tk.Tk):
             except Exception:
                 pass
 
+    # ---------------- підсумок по виділеному ---------------- #
+
+    def _update_selection(self, which):
+        """Скільки виділено і на скільки байтів.
+
+        Розмір файлів відомий одразу зі списку, а тек — лише після
+        «Σ Розмір теки»: Drive не віддає його при перегляді.
+        """
+        if which == "r":
+            tree, metas, lbl = self.rtree, self.rmeta, self.lbl_rsel
+        else:
+            tree, metas, lbl = self.ltree, self.lmeta, self.lbl_lsel
+
+        sel = [i for i in tree.selection() if i in metas]
+        if not sel:
+            lbl.configure(text="Виділено: —")
+            return
+
+        total = files = dirs = unknown = 0
+        for iid in sel:
+            m = metas[iid]
+            if m.get("dir"):
+                dirs += 1
+            else:
+                files += 1
+            size = m.get("size")
+            if size is None:
+                unknown += 1
+            else:
+                total += int(size)
+
+        what = ", ".join(x for x in (f"тек {dirs}" if dirs else "",
+                                     f"файлів {files}" if files else "") if x)
+        text = f"Виділено: {len(sel)} ({what})   ·   {human(total)}"
+        if unknown:
+            text += f"   ·   без розміру: {unknown} — рахує «Σ Розмір теки»"
+        lbl.configure(text=text)
+
+    # ---------------- видалення ---------------- #
+
+    def _confirm_delete(self, names, where) -> bool:
+        preview = "\n".join("  • " + n for n in names[:12])
+        if len(names) > 12:
+            preview += f"\n  … і ще {len(names) - 12}"
+        return messagebox.askyesno(
+            APP_NAME,
+            f"Видалити {len(names)} об'єктів {where}?\n\n{preview}\n\n"
+            "Теки видаляються разом із усім вмістом.",
+            icon="warning")
+
+    def _delete_local(self):
+        sel = [i for i in self.ltree.selection() if i in self.lmeta]
+        # корінь диска — не чіпаємо
+        safe, roots = [], 0
+        for i in sel:
+            p = Path(self.lmeta[i]["path"])
+            if p.parent == p:
+                roots += 1
+            else:
+                safe.append(i)
+        if roots:
+            self._log(f"Корінь диска видалити не можна — пропущено {roots}.")
+        if not safe:
+            messagebox.showinfo(APP_NAME, "Треба виділити зліва те, що видалити.")
+            return
+
+        paths = [self.lmeta[i]["path"] for i in safe]
+        if not self._confirm_delete([Path(p).name for p in paths], "у Кошик Windows"):
+            return
+        try:
+            rc, aborted = send_to_recycle_bin(paths)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"Не вдалося видалити:\n{e}")
+            return
+        if rc == 0 and not aborted:
+            self._log(f"[✓] У Кошик Windows: {len(paths)} об'єктів")
+        else:
+            self._log(f"[!] Видалення завершилось з кодом {rc}"
+                      + (" (перервано)" if aborted else ""))
+        self._after_delete("l", list({self.ltree.parent(i) for i in safe}))
+
+    def _delete_remote(self):
+        sel = [i for i in self.rtree.selection()
+               if i in self.rmeta and self.rmeta[i].get("path")]
+        if not sel:
+            messagebox.showinfo(APP_NAME, "Треба виділити справа те, що видалити.")
+            return
+        names = [self.rmeta[i].get("name") or self.rmeta[i]["path"] for i in sel]
+        if not self._confirm_delete(names, "у Кошик Google Drive"):
+            return
+
+        prefix = self._remote_prefix()
+        targets = [(self.rmeta[i]["dir"], prefix + self.rmeta[i]["path"]) for i in sel]
+        parents = list({self.rtree.parent(i) for i in sel})
+        self._log(f"Видаляю {len(targets)} об'єктів у Кошик Google Drive…")
+        threading.Thread(target=self._delete_remote_worker,
+                         args=(targets, parents), daemon=True).start()
+
+    def _delete_remote_worker(self, targets, parents):
+        ok = fail = 0
+        for isdir, target in targets:
+            # purge прибирає теку з вмістом, deletefile — один файл;
+            # обидві поважають --drive-use-trash, тож летить у Кошик
+            cmd = [self.rclone, "purge" if isdir else "deletefile", target]
+            try:
+                r = run_capture(cmd, timeout=900)
+                if r.returncode == 0:
+                    ok += 1
+                    self.q.put(("log", f"[✓] Видалено: {target}"))
+                else:
+                    fail += 1
+                    self.q.put(("log", f"[!] {target}: {rclone_error(r.stderr)}"))
+            except Exception as e:
+                fail += 1
+                self.q.put(("log", f"[!] {target}: {e}"))
+        self.q.put(("log", f"Готово: видалено {ok}, з помилками {fail}. "
+                           f"Видалене лежить у Кошику Drive 30 днів."))
+        self.q.put(("rdel", ("r", parents)))
+
+    def _after_delete(self, which, parents):
+        tree = self.rtree if which == "r" else self.ltree
+        metas = self.rmeta if which == "r" else self.lmeta
+        for p in parents:
+            if p and tree.exists(p) and p in metas:
+                self._refresh_node(which, p)
+            elif not p:                      # видаляли з верхнього рівня
+                if which == "r":
+                    self._load_remote_root()
+                else:
+                    self._load_local_roots()
+        self._update_selection(which)
+
     # ---------------- розмір тек (на вимогу, для обох дерев) ---------------- #
 
     def _base_label(self, which: str, iid) -> str:
@@ -1179,11 +1403,16 @@ class App(tk.Tk):
         if not tree.exists(iid):
             return
         base = self._base_label(which, iid)
+        meta = (self.rmeta if which == "r" else self.lmeta).get(iid)
         if err:
             tree.item(iid, text=f"{base}   (не порахувалось)")
             self._log(f"size: {err}")
         else:
             tree.item(iid, text=f"{base}   [{human(nbytes)} · {count} файлів]")
+            if meta is not None:
+                meta["size"] = nbytes          # тепер тека враховується в підсумку
+                meta["files"] = count
+        self._update_selection(which)
 
     # ---------------- черга ---------------- #
 
@@ -1340,6 +1569,8 @@ class App(tk.Tk):
                     self._fill_remote(*payload)
                 elif kind == "rsize":
                     self._apply_size(*payload)
+                elif kind == "rdel":
+                    self._after_delete(*payload)
                 elif kind == "job":
                     j = payload["job"]
                     self._job_pos = (payload["index"], payload["total"])
