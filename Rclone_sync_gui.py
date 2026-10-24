@@ -599,6 +599,7 @@ class App(tk.Tk):
         self.worker = None
         self.jobs = []
         self.job_rows = {}       # id(Job) -> рядок у таблиці черги
+        self.job_state = {}      # id(Job) -> підсумковий стан по всіх проходах
         self.log_full = []       # журнал без скорочень, незалежно від режиму показу
         self.var_compact = tk.BooleanVar(value=bool(self.cfg.get("compact_log", False)))
         self._job_pos = (0, 0)   # (поточне завдання, усього) — для відсотка в заголовку
@@ -1539,11 +1540,27 @@ class App(tk.Tk):
             self._log(f"Додано в чергу під час роботи: {job.name} — "
                       f"піде одразу після поточних")
 
+    # помилка значущіша за успіх, успіх — за пропуск
+    _STATE_RANK = {"skip": 1, "ok": 2, "fail": 3}
+
     def _mark_job(self, job, state):
-        """Позначка стану в першій колонці черги."""
+        """Позначка стану в першій колонці черги.
+
+        У двопрохідному режимі завдання отримує подію двічі: в одному
+        проході передається, в іншому відсівається фільтром за розміром.
+        Тому лишаємо найзначущіший стан, а не останній — інакше «✓»
+        затирається на «–», наче файл і не копіювався.
+        """
         iid = self.job_rows.get(id(job))
         if not iid or not self.qtree.exists(iid):
             return
+        if state in self._STATE_RANK:
+            prev = self.job_state.get(id(job))
+            if prev is None or self._STATE_RANK[state] > self._STATE_RANK[prev]:
+                self.job_state[id(job)] = state
+            state = self.job_state[id(job)]
+        elif not state:
+            self.job_state.pop(id(job), None)
         mark = {"run": "▶", "ok": "✓", "fail": "!", "skip": "–"}.get(state, "")
         arrow = "⬆" if job.direction == "up" else "⬇"
         vals = list(self.qtree.item(iid, "values"))
@@ -1555,12 +1572,15 @@ class App(tk.Tk):
             idx = self.qtree.index(iid)
             self.qtree.delete(iid)
             if 0 <= idx < len(self.jobs):
-                self.job_rows.pop(id(self.jobs.pop(idx)), None)
+                job = self.jobs.pop(idx)
+                self.job_rows.pop(id(job), None)
+                self.job_state.pop(id(job), None)
 
     def _clear_jobs(self):
         self.qtree.delete(*self.qtree.get_children())
         self.jobs.clear()
         self.job_rows.clear()
+        self.job_state.clear()
 
     def _calc_size(self):
         if not self.jobs:
@@ -1628,7 +1648,8 @@ class App(tk.Tk):
                   f"dry-run={'ТАК' if self.var_dry.get() else 'ні'}"
                   + (f" · проходів: {len(passes)}" if len(passes) > 1 else ""))
 
-        for j in self.jobs:                  # скидаємо позначки минулого запуску
+        self.job_state.clear()               # скидаємо позначки минулого запуску
+        for j in self.jobs:
             self._mark_job(j, "")
         # передаємо саме живий список: додане під час роботи підхопиться само
         self.worker = RcloneWorker(self.rclone, self.jobs, mode, self.var_ow.get(),
