@@ -463,31 +463,51 @@ class RcloneWorker(threading.Thread):
         return cmd
 
     def run(self):
-        total = len(self.jobs) * len(self.passes)
+        """self.jobs — жива черга, спільна з вікном.
+
+        Те, що додали вже під час роботи, підхоплюється наступним колом:
+        нову порцію проганяємо через усі проходи окремо, інакше додане
+        посеред другого проходу пропустило б перший.
+        """
         errors = 0
         started = time.time()
         idx = 0
+        handled = set()
+        round_no = 0
 
-        for label, flags, transfers in self.passes:
-            if self._stop.is_set():
+        while not self._stop.is_set():
+            batch = [j for j in list(self.jobs) if id(j) not in handled]
+            if not batch:
                 break
-            if label:
-                self.emit("log", f"───  {label}  ·  потоків {transfers}  ·  {flags}")
+            handled.update(id(j) for j in batch)
+            round_no += 1
+            if round_no > 1:
+                self.emit("log", f"+ Додано в роботу: {len(batch)} нових завдань")
 
-            for job in self.jobs:
+            for label, flags, transfers in self.passes:
                 if self._stop.is_set():
                     break
-                idx += 1
-                why = self.skip_by_size(job, flags)
-                if why:
-                    self.emit("log", f"[–] Пропущено «{job.name}»: файл {why}")
-                    continue
-                cmd = self.build_cmd(job, flags, transfers)
-                self.emit("job", {"index": idx, "total": total, "job": job,
-                                  "dst": job.dst_full(self.mode), "pass": label})
-                self.emit("log", "$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd))
-                if not self._run_one(job, cmd):
-                    errors += 1
+                if label:
+                    self.emit("log", f"───  {label}  ·  потоків {transfers}  ·  {flags}")
+
+                for job in batch:
+                    if self._stop.is_set():
+                        break
+                    idx += 1
+                    total = max(len(self.jobs) * len(self.passes), idx)
+                    why = self.skip_by_size(job, flags)
+                    if why:
+                        self.emit("log", f"[–] Пропущено «{job.name}»: файл {why}")
+                        self.emit("jobdone", (job, "skip"))
+                        continue
+                    cmd = self.build_cmd(job, flags, transfers)
+                    self.emit("job", {"index": idx, "total": total, "job": job,
+                                      "dst": job.dst_full(self.mode), "pass": label})
+                    self.emit("log", "$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd))
+                    ok = self._run_one(job, cmd)
+                    if not ok:
+                        errors += 1
+                    self.emit("jobdone", (job, "ok" if ok else "fail"))
 
         self.emit("done", {"errors": errors,
                            "cancelled": self._stop.is_set(),
@@ -578,6 +598,9 @@ class App(tk.Tk):
         self.q = queue.Queue()
         self.worker = None
         self.jobs = []
+        self.job_rows = {}       # id(Job) -> рядок у таблиці черги
+        self.log_full = []       # журнал без скорочень, незалежно від режиму показу
+        self.var_compact = tk.BooleanVar(value=bool(self.cfg.get("compact_log", False)))
         self._job_pos = (0, 0)   # (поточне завдання, усього) — для відсотка в заголовку
         self._two_pass = False   # профіль «обидва проходи» — Старт жене чергу двічі
 
@@ -740,7 +763,7 @@ class App(tk.Tk):
         self.qtree.heading("dir", text="")
         self.qtree.heading("src", text="Джерело")
         self.qtree.heading("dst", text="Призначення")
-        self.qtree.column("dir", width=40, anchor="center", stretch=False)
+        self.qtree.column("dir", width=58, anchor="center", stretch=False)
         self.qtree.column("src", width=460)
         self.qtree.column("dst", width=460)
         qsb = ttk.Scrollbar(qf, orient="vertical", command=self.qtree.yview)
@@ -857,6 +880,8 @@ class App(tk.Tk):
         self.btn_stop.pack(side="left", padx=6)
         ttk.Button(bf, text="Очистити журнал", command=self._clear_log).pack(side="right")
         ttk.Button(bf, text="Копіювати журнал", command=self._copy_log_all).pack(side="right", padx=6)
+        ttk.Checkbutton(bf, text="Стислий журнал", variable=self.var_compact,
+                        command=self._rerender_log).pack(side="right", padx=6)
 
         # --- РОЗКЛАДКА ---
         # Закріплена смуга внизу: її не видно в прокрутці, тому «Старт»
@@ -1507,18 +1532,35 @@ class App(tk.Tk):
     def _add_job(self, job: Job):
         self.jobs.append(job)
         arrow = "⬆" if job.direction == "up" else "⬇"
-        self.qtree.insert("", "end", values=(arrow, job.src, job.dst_full(self.var_mode.get())))
+        iid = self.qtree.insert("", "end",
+                                values=(arrow, job.src, job.dst_full(self.var_mode.get())))
+        self.job_rows[id(job)] = iid
+        if self.worker and self.worker.is_alive():
+            self._log(f"Додано в чергу під час роботи: {job.name} — "
+                      f"піде одразу після поточних")
+
+    def _mark_job(self, job, state):
+        """Позначка стану в першій колонці черги."""
+        iid = self.job_rows.get(id(job))
+        if not iid or not self.qtree.exists(iid):
+            return
+        mark = {"run": "▶", "ok": "✓", "fail": "!", "skip": "–"}.get(state, "")
+        arrow = "⬆" if job.direction == "up" else "⬇"
+        vals = list(self.qtree.item(iid, "values"))
+        vals[0] = f"{mark}{arrow}" if mark else arrow
+        self.qtree.item(iid, values=vals)
 
     def _remove_job(self):
         for iid in self.qtree.selection():
             idx = self.qtree.index(iid)
             self.qtree.delete(iid)
             if 0 <= idx < len(self.jobs):
-                self.jobs.pop(idx)
+                self.job_rows.pop(id(self.jobs.pop(idx)), None)
 
     def _clear_jobs(self):
         self.qtree.delete(*self.qtree.get_children())
         self.jobs.clear()
+        self.job_rows.clear()
 
     def _calc_size(self):
         if not self.jobs:
@@ -1586,7 +1628,10 @@ class App(tk.Tk):
                   f"dry-run={'ТАК' if self.var_dry.get() else 'ні'}"
                   + (f" · проходів: {len(passes)}" if len(passes) > 1 else ""))
 
-        self.worker = RcloneWorker(self.rclone, list(self.jobs), mode, self.var_ow.get(),
+        for j in self.jobs:                  # скидаємо позначки минулого запуску
+            self._mark_job(j, "")
+        # передаємо саме живий список: додане під час роботи підхопиться само
+        self.worker = RcloneWorker(self.rclone, self.jobs, mode, self.var_ow.get(),
                                    self.var_dry.get(), passes, self.q)
         self.worker.start()
 
@@ -1609,8 +1654,11 @@ class App(tk.Tk):
                     self._apply_size(*payload)
                 elif kind == "rdel":
                     self._after_delete(*payload)
+                elif kind == "jobdone":
+                    self._mark_job(payload[0], payload[1])
                 elif kind == "job":
                     j = payload["job"]
+                    self._mark_job(j, "run")
                     self._job_pos = (payload["index"], payload["total"])
                     tag = f"{payload['pass']} · " if payload.get("pass") else ""
                     self.lbl_job.configure(
@@ -1676,13 +1724,37 @@ class App(tk.Tk):
 
     # ---------------- дрібниці ---------------- #
 
+    def _log_shown(self, entry: str) -> str:
+        """Що саме показати. Рішення приймається за формою запису, а не за
+        його змістом: rclone завжди кладе опис у перший рядок, а машинні
+        подробиці нижче. Однорядкові записи не чіпаються взагалі."""
+        if not self.var_compact.get():
+            return entry
+        lines = entry.splitlines()
+        if len(lines) <= 1:
+            return entry
+        return f"{lines[0]}   … +{len(lines) - 1} рядків"
+
     def _log(self, text):
+        entry = time.strftime("[%H:%M:%S] ") + str(text)
+        self.log_full.append(entry)
         self.log.configure(state="normal")
-        self.log.insert("end", time.strftime("[%H:%M:%S] ") + str(text) + "\n")
+        self.log.insert("end", self._log_shown(entry) + "\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def _rerender_log(self):
+        self.cfg["compact_log"] = bool(self.var_compact.get())
+        save_cfg(self.cfg)
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        for e in self.log_full:
+            self.log.insert("end", self._log_shown(e) + "\n")
         self.log.see("end")
         self.log.configure(state="disabled")
 
     def _clear_log(self):
+        self.log_full.clear()
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
@@ -1704,7 +1776,8 @@ class App(tk.Tk):
         return "break"
 
     def _copy_log_all(self):
-        self._to_clipboard(self.log.get("1.0", "end-1c"))
+        # у буфер завжди повний текст, навіть коли на екрані стислий
+        self._to_clipboard("\n".join(self.log_full))
 
     def _select_log_all(self, _evt=None):
         self.log.tag_add("sel", "1.0", "end-1c")
