@@ -1635,14 +1635,17 @@ class App(tk.Tk):
         if total:
             self.title(f"{APP_NAME} — {frac * 100:.0f}%  "
                        f"[{self._job_pos[0]}/{self._job_pos[1]}]")
+        cur = st.get("transferring") or []
+        # поточна швидкість — сума по файлах, що саме йдуть; загальна «speed»
+        # у rclone це середнє від початку, тож на паузах вона повзе вниз
+        now = sum((t.get("speed") or 0) for t in cur)
         self.lbl_stats.configure(
             text=f"{pct_txt}   ·   {human(done)} / {human(total)}   ·   "
-                 f"{human(st.get('speed'))}/с   ·   "
+                 f"{human(now)}/с (сер. {human(st.get('speed'))}/с)   ·   "
                  f"ETA {human_time(st.get('eta'))}   ·   "
                  f"файлів {st.get('transfers', 0)}/{st.get('totalTransfers', 0)}   ·   "
                  f"перевірено {st.get('checks', 0)}   ·   "
                  f"помилок {st.get('errors', 0)}")
-        cur = st.get("transferring") or []
         if cur:
             parts = []
             for t in cur[:3]:
