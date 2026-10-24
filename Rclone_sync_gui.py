@@ -206,6 +206,16 @@ def rclone_error(stderr: str, limit: int = 300) -> str:
     return pick[:limit]
 
 
+def parse_size(text: str):
+    """«64M», «250k», «1G» -> байти. None, якщо не розпізнано."""
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*([kmgtp]?)i?b?\s*$", (text or "").lower())
+    if not m:
+        return None
+    mult = {"": 1, "k": 1024, "m": 1024 ** 2,
+            "g": 1024 ** 3, "t": 1024 ** 4, "p": 1024 ** 5}[m.group(2)]
+    return int(float(m.group(1)) * mult)
+
+
 def sane_geometry(geo: str, sw: int, sh: int) -> str:
     """Відкидає збережену позицію, якщо вікно опинилося б поза екраном.
 
@@ -359,6 +369,7 @@ class Job:
     is_dir: bool
     direction: str    # "up" | "down"
     name: str
+    size: int = None  # лише для файлів; потрібен, щоб відсіяти їх за розміром
 
     def dst_full(self, mode: str) -> str:
         """rclone copy DIR DST кладе ВМІСТ теки в DST, тому дописуємо ім'я теки."""
@@ -402,6 +413,29 @@ class RcloneWorker(threading.Thread):
     def emit(self, kind, payload):
         self.q.put((kind, payload))
 
+    def skip_by_size(self, job: Job, flags: str) -> str:
+        """Чи пропустити завдання через --max-size / --min-size.
+
+        rclone застосовує ці фільтри лише при обході теки. Коли джерелом
+        указано конкретний файл, він бере його беззастережно — тож у режимі
+        двох проходів великий файл поїхав би з налаштуваннями для дрібних.
+        Повертає причину пропуску або порожній рядок.
+        """
+        if job.is_dir or job.size is None:
+            return ""
+        toks = split_flags(flags)
+        for i, t in enumerate(toks[:-1]):
+            if t not in ("--max-size", "--min-size"):
+                continue
+            limit = parse_size(toks[i + 1])
+            if limit is None:
+                continue
+            if t == "--max-size" and job.size > limit:
+                return f"більший за {toks[i + 1]}"
+            if t == "--min-size" and job.size < limit:
+                return f"менший за {toks[i + 1]}"
+        return ""
+
     def build_cmd(self, job: Job, flags: str, transfers: int):
         mode = self.mode
         # sync для одиничного файлу небезпечний/некоректний -> зводимо до copy
@@ -444,6 +478,10 @@ class RcloneWorker(threading.Thread):
                 if self._stop.is_set():
                     break
                 idx += 1
+                why = self.skip_by_size(job, flags)
+                if why:
+                    self.emit("log", f"[–] Пропущено «{job.name}»: файл {why}")
+                    continue
                 cmd = self.build_cmd(job, flags, transfers)
                 self.emit("job", {"index": idx, "total": total, "job": job,
                                   "dst": job.dst_full(self.mode), "pass": label})
@@ -1448,7 +1486,7 @@ class App(tk.Tk):
             return
         for m in srcs:
             name = Path(m["path"]).name or m["path"].replace("\\", "").replace(":", "")
-            self._add_job(Job(m["path"], dst, m["dir"], "up", name))
+            self._add_job(Job(m["path"], dst, m["dir"], "up", name, m.get("size")))
 
     def _queue_download(self):
         srcs = [self.rmeta[i] for i in self.rtree.selection() if i in self.rmeta]
@@ -1463,8 +1501,8 @@ class App(tk.Tk):
                                           "призначення.")
             return
         for m in srcs:
-            self._add_job(Job(self._remote_prefix() + m["path"], dst,
-                              m["dir"], "down", m.get("name") or m["path"].split("/")[-1]))
+            self._add_job(Job(self._remote_prefix() + m["path"], dst, m["dir"], "down",
+                              m.get("name") or m["path"].split("/")[-1], m.get("size")))
 
     def _add_job(self, job: Job):
         self.jobs.append(job)
