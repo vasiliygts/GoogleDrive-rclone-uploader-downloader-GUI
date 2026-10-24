@@ -5,6 +5,7 @@
 rclone.conf
 rclone.conf.*
 settings.json
+client_secret*.json
 
 # --- сторонній бінарник: 85 МБ, качається окремо (див. README) ---
 rclone.exe
