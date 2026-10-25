@@ -548,6 +548,11 @@ class RcloneWorker(threading.Thread):
                 else:
                     msg = obj.get("msg", "").strip()
                     lvl = obj.get("level", "")
+                    # назву файлу чи теки rclone кладе окремим полем; без неї
+                    # службові рядки виглядають як кілька однакових
+                    name = str(obj.get("object") or "").strip()
+                    if name and msg and not msg.startswith(name):
+                        msg = f"{name}: {msg}"
                     if msg and lvl in ("error", "warning", "notice"):
                         self.emit("log", f"[{lvl}] {msg}")
                         # Google віддає голий 400 на спробу створити теку
