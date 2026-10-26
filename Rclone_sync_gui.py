@@ -206,6 +206,76 @@ def rclone_error(stderr: str, limit: int = 300) -> str:
     return pick[:limit]
 
 
+# Як показувати типові повідомлення rclone: (фрагмент, позначка, текст).
+# Перший збіг виграє; невідомі повідомлення проходять як є.
+RCLONE_PHRASES = [
+    ("Copied (new)",                      "+", "скопійовано"),
+    ("Copied (replaced existing)",        "+", "замінено"),
+    ("Copied (server-side copy)",         "+", "скопійовано на боці сервера"),
+    ("Moved (server-side)",               "+", "переміщено на боці сервера"),
+    ("Moved (into",                       "+", "переміщено"),
+    ("Deleted",                           "×", "видалено"),
+    ("Unchanged skipping",                "=", "без змін"),
+    ("Skipped copy as --dry-run is set",  "·", "dry-run, не копіюється"),
+    ("Skipped delete as --dry-run is set", "·", "dry-run, не видаляється"),
+    ("Excluded (",                        "–", "виключено"),
+    ("Updated modification time",         "·", "оновлено час"),
+    ("Set directory modification time",   "·", "час теки оновлено"),
+    ("There was nothing to transfer",     "·", "передавати нічого"),
+]
+
+# Рівень DEBUG вмикається тільки в докладному режимі, і навіть там
+# беремо лише те, що говорить про долю конкретного файлу.
+DEBUG_KEEP = ("Unchanged skipping", "Excluded (")
+
+# Скільки показувати в журналі. Повний текст пишеться у файл незалежно.
+LOG_WIDGET_MAX = 5000      # скільки рядків тримати у вікні журналу
+
+LOG_LEVELS = {
+    "Коротко": "short",      # лише завдання й підсумки
+    "Звичайно": "normal",    # + передані файли
+    "Докладно": "detail",    # + пропущені, виключені, службові повідомлення
+}
+
+LEVEL_HINT = {
+    "short":  "тільки завдання й підсумок по кожному",
+    "normal": "плюс рядок на кожен переданий файл",
+    "detail": "плюс пропущені й виключені файли",
+}
+
+# Службове, що в звичайному режимі лише засмічує
+INFO_HIDE = ("Set directory modification time", "Starting transaction limiter",
+             "Starting bandwidth limiter",
+             # те саме, але з причиною, скаже підсумковий рядок завдання
+             "There was nothing to transfer")
+
+
+def short_path(p: str, limit: int = 56) -> str:
+    """Скорочує довгий шлях до початку й двох останніх частин.
+
+    Повний шлях лишається видимим у черзі й у докладному режимі.
+    """
+    if len(p) <= limit:
+        return p
+    sep = "\\" if "\\" in p else "/"
+    parts = [x for x in p.split(sep) if x]
+    if len(parts) < 4:          # ховати нічого, «…» лише подовжило б рядок
+        return p
+    return f"{parts[0]}{sep}…{sep}" + sep.join(parts[-2:])
+
+
+def tidy_rclone_msg(name: str, msg: str):
+    """(позначка, текст) для рядка журналу."""
+    for frag, mark, text in RCLONE_PHRASES:
+        if frag in msg:
+            if frag == "Excluded (" and ")" in msg:
+                text = "виключено (" + msg.split("(", 1)[1].rsplit(")", 1)[0] + ")"
+            return mark, f"{name} — {text}" if name else text
+    if name and not msg.startswith(name):
+        msg = f"{name}: {msg}"
+    return "·", msg
+
+
 def parse_size(text: str):
     """«64M», «250k», «1G» -> байти. None, якщо не розпізнано."""
     m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*([kmgtp]?)i?b?\s*$", (text or "").lower())
@@ -214,6 +284,17 @@ def parse_size(text: str):
     mult = {"": 1, "k": 1024, "m": 1024 ** 2,
             "g": 1024 ** 3, "t": 1024 ** 4, "p": 1024 ** 5}[m.group(2)]
     return int(float(m.group(1)) * mult)
+
+
+def size_bound(flags: str) -> str:
+    """«>64 МБ» чи «<64 МБ» — межа, за якою прохід відбирає файли."""
+    for opt, sign in (("--min-size", ">"), ("--max-size", "<")):
+        m = re.search(rf"{opt}\s+(\S+)", flags or "")
+        if m:
+            n = parse_size(m.group(1))
+            if n:
+                return sign + human(n).replace(".0", "")
+    return ""
 
 
 def sane_geometry(geo: str, sw: int, sh: int) -> str:
@@ -385,7 +466,8 @@ class Job:
 # --------------------------------------------------------------------------- #
 
 class RcloneWorker(threading.Thread):
-    def __init__(self, rclone, jobs, mode, overwrite, dry_run, passes, out_q):
+    def __init__(self, rclone, jobs, mode, overwrite, dry_run, passes, out_q,
+                 level="normal", show_cmd=False):
         """passes — список (підпис, прапорці, потоки).
 
         Звичайний запуск подає один прохід, кнопка «Обидва проходи» — два:
@@ -398,6 +480,13 @@ class RcloneWorker(threading.Thread):
         self.overwrite = overwrite
         self.dry_run = dry_run
         self.passes = passes
+        self.level = level
+        self.detailed = (level == "detail")
+        self.show_cmd = show_cmd
+        self._last_stats = None
+        self._bound = ""
+        self._copied = False
+        self._begun = {}         # файл -> коли почався, щоб порахувати тривалість
         self.q = out_q
         self.proc = None
         self._stop = threading.Event()
@@ -451,7 +540,7 @@ class RcloneWorker(threading.Thread):
             "--checkers", str(max(4, transfers * 2)),
             "--retries", "3",
             "--low-level-retries", "10",
-            "-v",
+            "-vv" if self.detailed else "-v",
         ]
         if self.overwrite == "newer":
             cmd.append("--update")
@@ -488,7 +577,9 @@ class RcloneWorker(threading.Thread):
                 if self._stop.is_set():
                     break
                 if label:
-                    self.emit("log", f"───  {label}  ·  потоків {transfers}  ·  {flags}")
+                    self.emit("log", f"══  {label}  ·  потоків {transfers}")
+                    if self.show_cmd and flags:
+                        self.emit("log", f"   · прапорці: {flags}")
 
                 for job in batch:
                     if self._stop.is_set():
@@ -503,8 +594,14 @@ class RcloneWorker(threading.Thread):
                     cmd = self.build_cmd(job, flags, transfers)
                     self.emit("job", {"index": idx, "total": total, "job": job,
                                       "dst": job.dst_full(self.mode), "pass": label})
-                    self.emit("log", "$ " + " ".join(f'"{c}"' if " " in c else c for c in cmd))
-                    ok = self._run_one(job, cmd)
+                    arrow = "⬆" if job.direction == "up" else "⬇"
+                    self.emit("log", f"▶ [{idx}/{total}] {arrow} "
+                                     f"{short_path(job.src)}  →  "
+                                     f"{short_path(job.dst_full(self.mode))}")
+                    if self.show_cmd:
+                        self.emit("log", "   · " + " ".join(
+                            f'"{c}"' if " " in c else c for c in cmd))
+                    ok = self._run_one(job, cmd, bound=size_bound(flags))
                     if not ok:
                         errors += 1
                     self.emit("jobdone", (job, "ok" if ok else "fail"))
@@ -513,8 +610,11 @@ class RcloneWorker(threading.Thread):
                            "cancelled": self._stop.is_set(),
                            "elapsed": time.time() - started})
 
-    def _run_one(self, job: Job, cmd) -> bool:
+    def _run_one(self, job: Job, cmd, bound="") -> bool:
         """Один запуск rclone: читає вивід до кінця. True — без помилки."""
+        self._last_stats = None
+        self._bound = bound
+        self._copied = False
         try:
             self.proc = subprocess.Popen(
                 cmd,
@@ -544,17 +644,26 @@ class RcloneWorker(threading.Thread):
                     continue
                 stats = obj.get("stats")
                 if stats:
+                    self._last_stats = stats
+                    # запам'ятовуємо, коли файл з'явився в роботі: rclone
+                    # тривалості не повідомляє, її доводиться міряти самим
+                    for t in (stats.get("transferring") or []):
+                        nm = t.get("name")
+                        if nm and nm not in self._begun:
+                            self._begun[nm] = time.time()
                     self.emit("stats", stats)
                 else:
                     msg = obj.get("msg", "").strip()
                     lvl = obj.get("level", "")
-                    # назву файлу чи теки rclone кладе окремим полем; без неї
-                    # службові рядки виглядають як кілька однакових
+                    # назву файлу чи теки rclone кладе окремим полем
                     name = str(obj.get("object") or "").strip()
-                    if name and msg and not msg.startswith(name):
-                        msg = f"{name}: {msg}"
-                    if msg and lvl in ("error", "warning", "notice"):
-                        self.emit("log", f"[{lvl}] {msg}")
+                    if not msg:
+                        continue
+
+                    if lvl in ("error", "warning", "notice"):
+                        text = msg if msg.startswith(name) or not name \
+                            else f"{name}: {msg}"
+                        self.emit("log", f"[{lvl}] {text}")
                         # Google віддає голий 400 на спробу створити теку
                         # в корені розділу «Комп'ютери» — підкажемо, що робити
                         if "badRequest" in msg and "make directory" in msg:
@@ -562,20 +671,74 @@ class RcloneWorker(threading.Thread):
                                       "    ↳ Якщо призначення — корінь теки «Комп'ютери», "
                                       "Google не дозволяє створювати там нові теки. "
                                       "Призначенням треба обрати наявну теку рівнем нижче.")
-                    elif msg:
-                        self.emit("log", msg)
+                        continue
+
+                    if lvl == "debug":
+                        if not self.detailed or not any(k in msg for k in DEBUG_KEEP):
+                            continue
+                    elif not self.detailed and any(s in msg for s in INFO_HIDE):
+                        continue
+
+                    mark, text = tidy_rclone_msg(name, msg)
+                    if mark == "+":
+                        self._copied = True
+                        text += self._extra(name, obj.get("size"))
+
+                    # «Коротко» — без рядків по окремих файлах
+                    if self.level == "short" and name:
+                        continue
+
+                    self.emit("log", f"   {mark} {text}")
             else:
                 self.emit("log", line)
 
         rc = self.proc.wait()
         if self._stop.is_set():
-            self.emit("log", f"[×] Перервано: {job.name}")
+            self.emit("log", f"×  Перервано: {job.name}")
             return True                      # скасування — не помилка
         if rc != 0:
-            self.emit("log", f"[!] Завдання «{job.name}» завершилось з кодом {rc}")
+            self.emit("log", f"!  {job.name} — завершилось з кодом {rc}")
             return False
-        self.emit("log", f"[✓] Готово: {job.name}")
+        self.emit("log", f"✓  {job.name} — {self._summary(job)}")
         return True
+
+    def _extra(self, name: str, size) -> str:
+        """Розмір і, якщо вдалось виміряти, тривалість передачі файлу."""
+        bits = []
+        if isinstance(size, (int, float)) and size > 0:
+            bits.append(human(size))
+        started = self._begun.pop(name, None)
+        if started:
+            took = time.time() - started
+            if took >= 1:
+                bits.append(f"за {human_time(took)}")
+        return (", " + ", ".join(bits)) if bits else ""
+
+    def _summary(self, job: Job) -> str:
+        """Короткий підсумок завдання з останньої статистики rclone."""
+        st = self._last_stats or {}
+        n = st.get("transfers") or 0
+        checks = st.get("checks") or 0
+        if not job.is_dir:
+            # для завдання-файлу rclone не рахує ні передач, ні перевірок,
+            # тож судити можна лише за тим, чи був рядок про копіювання
+            return "скопійовано" if self._copied else "вже є в призначенні"
+        if n:
+            parts = [f"передано {n}", human(st.get("bytes") or 0)]
+            if checks:
+                parts.append(f"вже було {checks}")
+        elif checks:
+            parts = [f"{checks} збігаються за назвою та розміром"]
+        elif self._bound:
+            # обмеження за розміром відсіює файли ще на обході теки,
+            # тому rclone їх навіть не рахує як перевірені
+            parts = [f"нема файлів {self._bound}"]
+        else:
+            parts = ["порожня тека"]
+        el = st.get("elapsedTime") or 0
+        if el >= 1:
+            parts.append(f"за {human_time(el)}")
+        return ", ".join(parts)
 
 
 # --------------------------------------------------------------------------- #
@@ -607,6 +770,9 @@ class App(tk.Tk):
         self.job_state = {}      # id(Job) -> підсумковий стан по всіх проходах
         self.log_full = []       # журнал без скорочень, незалежно від режиму показу
         self.var_compact = tk.BooleanVar(value=bool(self.cfg.get("compact_log", False)))
+        self.log_level = self.cfg.get("log_level", "normal")
+        self.var_cmd = tk.BooleanVar(value=bool(self.cfg.get("show_cmd", False)))
+        self.log_path = self.cfg.get("log_file", "")   # порожньо — у файл не пишемо
         self._job_pos = (0, 0)   # (поточне завдання, усього) — для відсотка в заголовку
         self._two_pass = False   # профіль «обидва проходи» — Старт жене чергу двічі
 
@@ -851,6 +1017,7 @@ class App(tk.Tk):
 
         # --- лог ---
         lg = ttk.LabelFrame(inner, text="Журнал", padding=4)
+
         gwrap = ttk.Frame(lg)
         gwrap.pack(fill="both", expand=True)
         self.log = tk.Text(gwrap, height=5, wrap="none", font=("Consolas", 9))
@@ -888,6 +1055,23 @@ class App(tk.Tk):
         ttk.Button(bf, text="Копіювати журнал", command=self._copy_log_all).pack(side="right", padx=6)
         ttk.Checkbutton(bf, text="Стислий журнал", variable=self.var_compact,
                         command=self._rerender_log).pack(side="right", padx=6)
+        self.btn_logfile = ttk.Button(bf, text="Файл журналу…", command=self._pick_log_file)
+        self.btn_logfile.pack(side="right", padx=6)
+        ttk.Checkbutton(bf, text="Службові мітки", variable=self.var_cmd,
+                        command=self._save_show_cmd).pack(side="right", padx=6)
+
+        self.cb_level = ttk.Combobox(bf, width=11, state="readonly",
+                                     values=list(LOG_LEVELS.keys()))
+        self.cb_level.set(next(k for k, v in LOG_LEVELS.items() if v == self.log_level))
+        self.cb_level.pack(side="right", padx=4)
+        self.cb_level.bind("<<ComboboxSelected>>", self._set_log_level)
+        ttk.Label(bf, text="Журнал:").pack(side="right")
+        # розшифровку обраного рівня ставимо ліворуч: там лишається вільне
+        # місце, а праворуч її витіснили б кнопки при вужчому вікні
+        self.lbl_level = ttk.Label(bf, foreground="#555")
+        self.lbl_level.pack(side="left", padx=10)
+        self._sync_logfile_button()
+        self._sync_level_hint()
 
         # --- РОЗКЛАДКА ---
         # Закріплена смуга внизу: її не видно в прокрутці, тому «Старт»
@@ -1652,13 +1836,17 @@ class App(tk.Tk):
         self._log(f"СТАРТ · режим={mode} · перезапис={self.var_ow.get()} · "
                   f"dry-run={'ТАК' if self.var_dry.get() else 'ні'}"
                   + (f" · проходів: {len(passes)}" if len(passes) > 1 else ""))
+        self._log(f"Журнал: {self.cb_level.get().lower()} — "
+                  f"{LEVEL_HINT[self.log_level]}")
 
         self.job_state.clear()               # скидаємо позначки минулого запуску
         for j in self.jobs:
             self._mark_job(j, "")
         # передаємо саме живий список: додане під час роботи підхопиться само
         self.worker = RcloneWorker(self.rclone, self.jobs, mode, self.var_ow.get(),
-                                   self.var_dry.get(), passes, self.q)
+                                   self.var_dry.get(), passes, self.q,
+                                   level=self.log_level,
+                                   show_cmd=bool(self.var_cmd.get()))
         self.worker.start()
 
     def _stop(self):
@@ -1764,17 +1952,69 @@ class App(tk.Tk):
     def _log(self, text):
         entry = time.strftime("[%H:%M:%S] ") + str(text)
         self.log_full.append(entry)
+        self._to_log_file(entry)
         self.log.configure(state="normal")
         self.log.insert("end", self._log_shown(entry) + "\n")
+        # на великих передачах рядків десятки тисяч; у вікні тримаємо хвіст,
+        # повний текст лишається в пам'яті та у файлі
+        if int(self.log.index("end-1c").split(".")[0]) > LOG_WIDGET_MAX + 1000:
+            self.log.delete("1.0", f"{1000}.0")
         self.log.see("end")
         self.log.configure(state="disabled")
+
+    def _set_log_level(self, _evt=None):
+        self.log_level = LOG_LEVELS.get(self.cb_level.get(), "normal")
+        self.cfg["log_level"] = self.log_level
+        save_cfg(self.cfg)
+        self._sync_level_hint()
+        self._log(f"Рівень журналу: {self.cb_level.get().lower()} — "
+                  f"{LEVEL_HINT[self.log_level]}. Діє з наступного запуску.")
+
+    def _sync_level_hint(self):
+        self.lbl_level.configure(text="— " + LEVEL_HINT[self.log_level])
+
+    def _save_show_cmd(self):
+        self.cfg["show_cmd"] = bool(self.var_cmd.get())
+        save_cfg(self.cfg)
+
+    def _pick_log_file(self):
+        if self.log_path:                      # повторний клік — перестаємо писати
+            self._log(f"Запис у файл вимкнено ({self.log_path})")
+            self.log_path = ""
+        else:
+            p = filedialog.asksaveasfilename(
+                title="Куди писати повний журнал", defaultextension=".log",
+                initialfile=time.strftime("rclone_%Y-%m-%d_%H-%M.log"),
+                filetypes=[("Журнал", "*.log"), ("Усі", "*.*")])
+            if not p:
+                return
+            self.log_path = p
+            self._log(f"Повний журнал пишеться у {p}")
+        self.cfg["log_file"] = self.log_path
+        save_cfg(self.cfg)
+        self._sync_logfile_button()
+
+    def _sync_logfile_button(self):
+        self.btn_logfile.configure(
+            text="Не писати у файл" if self.log_path else "Файл журналу…")
+
+    def _to_log_file(self, entry: str):
+        if not self.log_path:
+            return
+        try:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(entry + "\n")
+        except Exception as e:
+            self.log_path = ""                 # щоб не сипати помилками щорядка
+            self._sync_logfile_button()
+            self._log(f"[!] Не вдалось писати журнал у файл: {e}")
 
     def _rerender_log(self):
         self.cfg["compact_log"] = bool(self.var_compact.get())
         save_cfg(self.cfg)
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
-        for e in self.log_full:
+        for e in self.log_full[-LOG_WIDGET_MAX:]:
             self.log.insert("end", self._log_shown(e) + "\n")
         self.log.see("end")
         self.log.configure(state="disabled")
