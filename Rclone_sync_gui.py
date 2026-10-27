@@ -297,6 +297,40 @@ def size_bound(flags: str) -> str:
     return ""
 
 
+def size_flags(flags: str) -> list:
+    """Лише обмеження за розміром — щоб порахувати обсяг саме цього проходу."""
+    toks = split_flags(flags)
+    out = []
+    for i, t in enumerate(toks[:-1]):
+        if t in ("--max-size", "--min-size"):
+            out += [t, toks[i + 1]]
+    return out
+
+
+def skip_by_size(job, flags: str) -> str:
+    """Чи пропустити завдання через --max-size / --min-size.
+
+    rclone застосовує ці фільтри лише при обході теки. Коли джерелом
+    указано конкретний файл, він бере його беззастережно — тож у режимі
+    двох проходів великий файл поїхав би з налаштуваннями для дрібних.
+    Повертає причину пропуску або порожній рядок.
+    """
+    if job.is_dir or job.size is None:
+        return ""
+    toks = split_flags(flags)
+    for i, t in enumerate(toks[:-1]):
+        if t not in ("--max-size", "--min-size"):
+            continue
+        limit = parse_size(toks[i + 1])
+        if limit is None:
+            continue
+        if t == "--max-size" and job.size > limit:
+            return f"більший за {toks[i + 1]}"
+        if t == "--min-size" and job.size < limit:
+            return f"менший за {toks[i + 1]}"
+    return ""
+
+
 def sane_geometry(geo: str, sw: int, sh: int) -> str:
     """Відкидає збережену позицію, якщо вікно опинилося б поза екраном.
 
@@ -462,6 +496,64 @@ class Job:
 
 
 # --------------------------------------------------------------------------- #
+#  Обмірювання черги: знаменник для шкал прогресу
+# --------------------------------------------------------------------------- #
+
+class PlanWorker(threading.Thread):
+    """Рахує, скільки всього файлів і байтів доведеться передати.
+
+    Сам rclone знає лише те, що встиг обійти, тому його знаменник росте
+    на ходу. Тут обсяг кожного завдання міряється наперед окремою
+    командою «rclone size», а список завдань перечитується в циклі —
+    чергу можна поповнювати під час роботи, і шкали це врахують.
+    """
+
+    def __init__(self, rclone, jobs, passes, out_q):
+        super().__init__(daemon=True)
+        self.rclone = rclone
+        self.jobs = jobs
+        self.passes = passes
+        self.q = out_q
+        self._stop = threading.Event()
+
+    def cancel(self):
+        self._stop.set()
+
+    def run(self):
+        seen = set()
+        while not self._stop.is_set():
+            batch = [j for j in list(self.jobs) if id(j) not in seen]
+            if not batch:
+                self._stop.wait(0.7)
+                continue
+            seen.update(id(j) for j in batch)
+            for job in batch:
+                for label, flags, _tr in self.passes:
+                    if self._stop.is_set():
+                        return
+                    n, b, err = self._measure(job, flags)
+                    if err:
+                        self.q.put(("log", f"[!] Обсяг «{job.name}» не порахувався: {err}"))
+                    self.q.put(("plan", (id(job), label, n, b)))
+
+    def _measure(self, job, flags):
+        if not job.is_dir:
+            if skip_by_size(job, flags):
+                return 0, 0, ""
+            return 1, int(job.size or 0), ""
+        cmd = [self.rclone, "size", job.src, "--json", "--fast-list"] \
+            + size_flags(flags)
+        try:
+            r = run_capture(cmd, timeout=1800)
+            if r.returncode != 0:
+                return 0, 0, rclone_error(r.stderr)
+            d = json.loads(r.stdout or "{}")
+            return int(d.get("count") or 0), int(d.get("bytes") or 0), ""
+        except Exception as e:
+            return 0, 0, str(e)
+
+
+# --------------------------------------------------------------------------- #
 #  Виконавець rclone у фоновому потоці
 # --------------------------------------------------------------------------- #
 
@@ -503,27 +595,7 @@ class RcloneWorker(threading.Thread):
         self.q.put((kind, payload))
 
     def skip_by_size(self, job: Job, flags: str) -> str:
-        """Чи пропустити завдання через --max-size / --min-size.
-
-        rclone застосовує ці фільтри лише при обході теки. Коли джерелом
-        указано конкретний файл, він бере його беззастережно — тож у режимі
-        двох проходів великий файл поїхав би з налаштуваннями для дрібних.
-        Повертає причину пропуску або порожній рядок.
-        """
-        if job.is_dir or job.size is None:
-            return ""
-        toks = split_flags(flags)
-        for i, t in enumerate(toks[:-1]):
-            if t not in ("--max-size", "--min-size"):
-                continue
-            limit = parse_size(toks[i + 1])
-            if limit is None:
-                continue
-            if t == "--max-size" and job.size > limit:
-                return f"більший за {toks[i + 1]}"
-            if t == "--min-size" and job.size < limit:
-                return f"менший за {toks[i + 1]}"
-        return ""
+        return skip_by_size(job, flags)
 
     def build_cmd(self, job: Job, flags: str, transfers: int):
         mode = self.mode
@@ -774,6 +846,15 @@ class App(tk.Tk):
         self.var_cmd = tk.BooleanVar(value=bool(self.cfg.get("show_cmd", False)))
         self.log_path = self.cfg.get("log_file", "")   # порожньо — у файл не пишемо
         self._job_pos = (0, 0)   # (поточне завдання, усього) — для відсотка в заголовку
+        # підсумки по всій черзі: оброблене, заміряне наперед і поточний запуск
+        self._acc_bytes = self._acc_files = 0
+        self._sent_bytes = self._sent_files = 0
+        self.plan_bytes = self.plan_files = 0
+        self.plan_per = {}       # (id(завдання), прохід) -> (файлів, байтів)
+        self._cur_key = None
+        self._last_st = {}
+        self.planner = None
+        self.var_plan = tk.BooleanVar(value=bool(self.cfg.get("plan", True)))
         self._two_pass = False   # профіль «обидва проходи» — Старт жене чергу двічі
 
         # мапа iid -> метадані вузлів дерев
@@ -1008,10 +1089,33 @@ class App(tk.Tk):
 
         self.lbl_job = ttk.Label(pf, text="Очікування…", anchor="w")
         self.lbl_job.pack(fill="x")
-        self.pb = ttk.Progressbar(pf, maximum=1000)
-        self.pb.pack(fill="x", pady=3)
+
+        # дві шкали: самого обсягу мало, коли в теці тисячі дрібних файлів,
+        # самої кількості — коли серед них трапляється один великий
+        bars = ttk.Frame(pf)
+        bars.pack(fill="x", pady=3)
+        for c in (0, 1):
+            bars.columnconfigure(c, weight=1, uniform="half")
+        # підписи width=1: хай колонки ділять ширину порівну, а не
+        # розтягуються під найдовший текст
+        self.pb_one = ttk.Progressbar(bars, maximum=1000)
+        self.lbl_pb1 = ttk.Label(bars, anchor="w", width=1)
+        self.pb = ttk.Progressbar(bars, maximum=1000)
+        self.pb_files = ttk.Progressbar(bars, maximum=1000)
+        self.lbl_pb = ttk.Label(bars, anchor="w", width=1)
+        self.lbl_pbf = ttk.Label(bars, anchor="w", width=1)
+
+        self.pb_one.grid(row=0, column=0, columnspan=2, sticky="we")
+        self.lbl_pb1.grid(row=1, column=0, columnspan=2, sticky="we", pady=(1, 5))
+        self.pb.grid(row=2, column=0, sticky="we", padx=(0, 6))
+        self.pb_files.grid(row=2, column=1, sticky="we", padx=(6, 0))
+        self.lbl_pb.grid(row=3, column=0, sticky="we", padx=(0, 6), pady=(1, 0))
+        self.lbl_pbf.grid(row=3, column=1, sticky="we", padx=(6, 0), pady=(1, 0))
+
         self.lbl_stats = ttk.Label(pf, text="", anchor="w", foreground="#444")
         self.lbl_stats.pack(fill="x")
+        self.lbl_queue = ttk.Label(pf, text="", anchor="w", foreground="#444")
+        self.lbl_queue.pack(fill="x")
         self.lbl_cur = ttk.Label(pf, text="", anchor="w", foreground="#666")
         self.lbl_cur.pack(fill="x")
 
@@ -1051,6 +1155,8 @@ class App(tk.Tk):
         self.btn_start.pack(side="left")
         self.btn_stop = ttk.Button(bf, text="■  Стоп", command=self._stop, state="disabled")
         self.btn_stop.pack(side="left", padx=6)
+        ttk.Checkbutton(bf, text="Міряти обсяг черги", variable=self.var_plan,
+                        command=self._save_plan).pack(side="left", padx=6)
         ttk.Button(bf, text="Очистити журнал", command=self._clear_log).pack(side="right")
         ttk.Button(bf, text="Копіювати журнал", command=self._copy_log_all).pack(side="right", padx=6)
         ttk.Checkbutton(bf, text="Стислий журнал", variable=self.var_compact,
@@ -1832,6 +1938,13 @@ class App(tk.Tk):
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         self.pb["value"] = 0
+        self.pb_files["value"] = 0
+        self._acc_bytes = self._acc_files = 0
+        self._sent_bytes = self._sent_files = 0
+        self.plan_bytes = self.plan_files = 0
+        self.plan_per.clear()
+        self._cur_key = None
+        self._last_st = {}
         self._log("=" * 70)
         self._log(f"СТАРТ · режим={mode} · перезапис={self.var_ow.get()} · "
                   f"dry-run={'ТАК' if self.var_dry.get() else 'ні'}"
@@ -1848,8 +1961,18 @@ class App(tk.Tk):
                                    level=self.log_level,
                                    show_cmd=bool(self.var_cmd.get()))
         self.worker.start()
+        if self.var_plan.get():
+            self._log("Міряю обсяг черги — шкали покажуть частку від усього")
+            self.planner = PlanWorker(self.rclone, self.jobs, passes, self.q)
+            self.planner.start()
+        else:
+            self.planner = None
+            self._log("Обсяг черги не міряється — шкали показують лише "
+                      "поточне завдання")
 
     def _stop(self):
+        if self.planner:
+            self.planner.cancel()
         if self.worker:
             self._log("Скасування…")
             self.worker.cancel()
@@ -1870,15 +1993,19 @@ class App(tk.Tk):
                     self._after_delete(*payload)
                 elif kind == "jobdone":
                     self._mark_job(payload[0], payload[1])
+                elif kind == "plan":
+                    self._add_plan(*payload)
                 elif kind == "job":
                     j = payload["job"]
+                    self._roll_up()      # підбити попереднє завдання
                     self._mark_job(j, "run")
+                    self._cur_key = (id(j), payload.get("pass") or "")
                     self._job_pos = (payload["index"], payload["total"])
                     tag = f"{payload['pass']} · " if payload.get("pass") else ""
                     self.lbl_job.configure(
                         text=f"[{payload['index']}/{payload['total']}] {tag}"
                              f"{'⬆' if j.direction == 'up' else '⬇'} {j.src}  →  {payload['dst']}")
-                    self.pb["value"] = 0
+                    self._redraw_progress()
                 elif kind == "stats":
                     self._update_stats(payload)
                 elif kind == "done":
@@ -1888,26 +2015,18 @@ class App(tk.Tk):
         self._pump_id = self.after(120, self._pump)
 
     def _update_stats(self, st):
-        done = st.get("bytes", 0) or 0
-        total = st.get("totalBytes", 0) or 0
-        frac = (done / total) if total else 0.0
-        self.pb["value"] = min(1000, frac * 1000)
-        pct_txt = f"{frac * 100:.1f}%" if total else "—"
-        # відсоток дублюємо в заголовок: видно на панелі задач, коли вікно згорнуте
-        if total:
-            self.title(f"{APP_NAME} — {frac * 100:.0f}%  "
-                       f"[{self._job_pos[0]}/{self._job_pos[1]}]")
+        self._last_st = st
+        self._redraw_progress()
         cur = st.get("transferring") or []
         # поточна швидкість — сума по файлах, що саме йдуть; загальна «speed»
         # у rclone це середнє від початку, тож на паузах вона повзе вниз
         now = sum((t.get("speed") or 0) for t in cur)
         self.lbl_stats.configure(
-            text=f"{pct_txt}   ·   {human(done)} / {human(total)}   ·   "
-                 f"{human(now)}/с (сер. {human(st.get('speed'))}/с)   ·   "
+            text=f"{human(now)}/с (сер. {human(st.get('speed'))}/с)   ·   "
                  f"ETA {human_time(st.get('eta'))}   ·   "
-                 f"файлів {st.get('transfers', 0)}/{st.get('totalTransfers', 0)}   ·   "
                  f"перевірено {st.get('checks', 0)}   ·   "
                  f"помилок {st.get('errors', 0)}")
+        self._show_queue_total()
         if cur:
             parts = []
             for t in cur[:3]:
@@ -1918,7 +2037,120 @@ class App(tk.Tk):
         else:
             self.lbl_cur.configure(text="")
 
+    def _roll_up(self):
+        """Завдання, що завершилось, переносимо в оброблене.
+
+        rclone рахує статистику заново на кожен запуск, а запусків стільки,
+        скільки завдань помножити на проходи. Коли обсяг заміряно наперед,
+        беремо саме його: інакше завдання, де все вже було на місці, так
+        і лишилося б незарахованим, і шкала не дійшла б до кінця.
+        """
+        st = self._last_st or {}
+        self._sent_files += st.get("transfers", 0) or 0
+        self._sent_bytes += st.get("bytes", 0) or 0
+        planned = self.plan_per.get(self._cur_key) if self._cur_key else None
+        if planned:
+            self._acc_files += planned[0]
+            self._acc_bytes += planned[1]
+        else:
+            self._acc_files += (st.get("transfers", 0) or 0) + (st.get("checks", 0) or 0)
+            self._acc_bytes += st.get("bytes", 0) or 0
+        self._last_st = {}
+        self._cur_key = None
+
+    def _redraw_one_file(self, cur):
+        """Шкала поточного файлу.
+
+        Потоків може бути кілька, а шкала одна, тож показуємо найбільший
+        файл із тих, що зараз ідуть: саме він визначає, скільки чекати.
+        Решту видно рядком нижче.
+        """
+        if not cur:
+            self.pb_one["value"] = 0
+            self.lbl_pb1.configure(text="Файл   —")
+            return
+        t = max(cur, key=lambda x: x.get("size") or 0)
+        size = t.get("size") or 0
+        done = t.get("bytes") or 0
+        p = t.get("percentage")
+        frac = (p / 100.0) if p is not None else ((done / size) if size else 0.0)
+        self.pb_one["value"] = min(1000, frac * 1000)
+        name = str(t.get("name") or "")
+        name = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        if len(name) > 34:
+            name = name[:31] + "…"
+        more = f"   (+{len(cur) - 1})" if len(cur) > 1 else ""
+        self.lbl_pb1.configure(
+            text=f"Файл   {frac * 100:5.1f}%   {human(done)} / {human(size)}"
+                 f"   ·   {name}{more}")
+
+    def _add_plan(self, key_id, label, files, nbytes):
+        """Заміряне завдання: збільшуємо знаменник шкал."""
+        key = (key_id, label)
+        if key in self.plan_per:
+            return
+        self.plan_per[key] = (files, nbytes)
+        self.plan_files += files
+        self.plan_bytes += nbytes
+        self._redraw_progress()
+
+    def _redraw_progress(self):
+        """Три шкали: уся черга за обсягом, за кількістю файлів і поточний файл.
+
+        Поки обсяг черги не заміряно, перші дві показують те, що встиг
+        нарахувати сам rclone по поточному завданню, — інакше шкал не
+        було б узагалі.
+        """
+        st = self._last_st or {}
+        self._redraw_one_file(st.get("transferring") or [])
+        run_b = st.get("bytes", 0) or 0
+        run_f = (st.get("transfers", 0) or 0) + (st.get("checks", 0) or 0)
+        whole = self.plan_files or self.plan_bytes
+        if whole:
+            done_b, total_b = self._acc_bytes + run_b, self.plan_bytes
+            done_f, total_f = self._acc_files + run_f, self.plan_files
+            jb, jf = st.get("totalBytes") or 0, st.get("totalTransfers") or 0
+            # по завданню лишаємо тільки відсоток: під половинну ширину
+            # повні числа не влізають, а подробиці є в рядку нижче
+            tail_b = f"   ·   завдання {run_b / jb * 100:.0f}%" if jb else ""
+            tail_f = f"   ·   завдання {run_f / jf * 100:.0f}%" if jf else ""
+        else:
+            done_b, total_b = run_b, st.get("totalBytes", 0) or 0
+            done_f, total_f = run_f, st.get("totalTransfers", 0) or 0
+            tail_b = tail_f = ""
+
+        fb = (done_b / total_b) if total_b else 0.0
+        ff = (done_f / total_f) if total_f else 0.0
+        self.pb["value"] = min(1000, fb * 1000)
+        self.pb_files["value"] = min(1000, ff * 1000)
+        self.lbl_pb.configure(text=f"Обсяг   {fb * 100:5.1f}%   {human(done_b)} / "
+                                   f"{human(total_b)}{tail_b}"
+                              if total_b else "Обсяг   —")
+        self.lbl_pbf.configure(text=f"Файли   {ff * 100:5.1f}%   {done_f} / "
+                                    f"{total_f}{tail_f}"
+                               if total_f else "Файли   —")
+        # відсоток дублюємо в заголовок: видно на панелі задач, коли вікно згорнуте
+        if total_b:
+            self.title(f"{APP_NAME} — {fb * 100:.0f}%  "
+                       f"[{self._job_pos[0]}/{self._job_pos[1]}]")
+
+    def _show_queue_total(self):
+        st = self._last_st or {}
+        files = self._sent_files + (st.get("transfers", 0) or 0)
+        size = self._sent_bytes + (st.get("bytes", 0) or 0)
+        pos, total = self._job_pos
+        text = (f"Черга: завдання {pos} з {total}   ·   "
+                f"справді передано {files} файлів, {human(size)}")
+        if self.planner and self.planner.is_alive():
+            text += "   ·   обсяг черги ще рахується…"
+        self.lbl_queue.configure(text=text)
+
     def _finish(self, payload):
+        if self.planner:
+            self.planner.cancel()
+        self._roll_up()
+        self._redraw_progress()
+        self._show_queue_total()
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
         self.title(APP_NAME)
@@ -1975,6 +2207,10 @@ class App(tk.Tk):
 
     def _save_show_cmd(self):
         self.cfg["show_cmd"] = bool(self.var_cmd.get())
+        save_cfg(self.cfg)
+
+    def _save_plan(self):
+        self.cfg["plan"] = bool(self.var_plan.get())
         save_cfg(self.cfg)
 
     def _pick_log_file(self):
