@@ -11,6 +11,9 @@ Python + tkinter, no pip dependencies at all.
 The interface speaks both languages: pick **Language** in the top bar, the
 choice is remembered.
 
+The program runs on your computer only and collects nothing about you — the
+details are in the [privacy policy](PRIVACY.en.md).
+
 ## What you need
 
 Two third-party things, both free:
