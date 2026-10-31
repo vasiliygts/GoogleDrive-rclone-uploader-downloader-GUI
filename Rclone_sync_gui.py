@@ -288,12 +288,17 @@ EN = {
     "Файл   —": "File   —",
     "Обсяг   —": "Size   —",
     "Файли   —": "Files   —",
-    "Файл   {pct:5.1f}%   {done} / {size}   ·   {name}{more}":
-        "File   {pct:5.1f}%   {done} / {size}   ·   {name}{more}",
-    "Обсяг   {pct:5.1f}%   {done} / {total}{tail}":
-        "Size   {pct:5.1f}%   {done} / {total}{tail}",
-    "Файли   {pct:5.1f}%   {done} / {total}{tail}":
-        "Files   {pct:5.1f}%   {done} / {total}{tail}",
+    "Файл   {pct:5.1f}%   {done} / {size}{more}   ·   {name}":
+        "File   {pct:5.1f}%   {done} / {size}{more}   ·   {name}",
+    "   (+{n})": "   (+{n})",
+    "Обсяг   черга {pct:5.1f}%   {done} / {total}{tail}":
+        "Size   queue {pct:5.1f}%   {done} / {total}{tail}",
+    "Файли   черга {pct:5.1f}%   {done} / {total}{tail}":
+        "Files   queue {pct:5.1f}%   {done} / {total}{tail}",
+    "Обсяг   завдання {pct:5.1f}%   {done} / {total}":
+        "Size   job {pct:5.1f}%   {done} / {total}",
+    "Файли   завдання {pct:5.1f}%   {done} / {total}":
+        "Files   job {pct:5.1f}%   {done} / {total}",
     "   ·   завдання {pct:.0f}%": "   ·   job {pct:.0f}%",
     "{now}/с (сер. {avg}/с)   ·   ETA {eta}   ·   перевірено {checks}   ·   помилок {errors}":
         "{now}/s (avg {avg}/s)   ·   ETA {eta}   ·   checked {checks}   ·   errors {errors}",
@@ -2898,13 +2903,18 @@ class App(tk.Tk):
         p = t.get("percentage")
         frac = (p / 100.0) if p is not None else ((done / size) if size else 0.0)
         self.pb_one["value"] = min(1000, frac * 1000)
+        # назва як є, разом із підтекою всередині завдання: рядок на всю
+        # ширину вікна, місця вистачає
+        # the name as it comes, subfolder within the job included: the line
+        # spans the whole window and there is room for it
         name = str(t.get("name") or "")
-        name = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-        if len(name) > 34:
-            name = name[:31] + "…"
-        more = f"   (+{len(cur) - 1})" if len(cur) > 1 else ""
+        # лічильник решти — перед назвою: якщо дуже довга назва не влізе,
+        # кількість інших файлів усе одно лишиться на видноті
+        # the counter goes before the name: if a very long name does not fit,
+        # the number of other files stays visible anyway
+        more = tr("   (+{n})", n=len(cur) - 1) if len(cur) > 1 else ""
         self.lbl_pb1.configure(text=tr(
-            "Файл   {pct:5.1f}%   {done} / {size}   ·   {name}{more}",
+            "Файл   {pct:5.1f}%   {done} / {size}{more}   ·   {name}",
             pct=frac * 100, done=human(done), size=human(size),
             name=name, more=more))
 
@@ -2957,13 +2967,23 @@ class App(tk.Tk):
         ff = (done_f / total_f) if total_f else 0.0
         self.pb["value"] = min(1000, fb * 1000)
         self.pb_files["value"] = min(1000, ff * 1000)
+        # коли обсяг черги заміряно, ліве число — частка всієї черги, праве —
+        # частка поточного завдання; без заміру число лише одне, і воно про
+        # завдання, тому підпис інший
+        # with the queue measured the left figure is a share of the whole
+        # queue and the right one of the current job; without it there is
+        # only one figure, about the job, hence a different label
+        whole_b = "Обсяг   черга {pct:5.1f}%   {done} / {total}{tail}"
+        whole_f = "Файли   черга {pct:5.1f}%   {done} / {total}{tail}"
+        job_b = "Обсяг   завдання {pct:5.1f}%   {done} / {total}"
+        job_f = "Файли   завдання {pct:5.1f}%   {done} / {total}"
         self.lbl_pb.configure(
-            text=tr("Обсяг   {pct:5.1f}%   {done} / {total}{tail}",
+            text=tr(whole_b if whole else job_b,
                     pct=fb * 100, done=human(done_b), total=human(total_b),
                     tail=tail_b)
             if total_b else tr("Обсяг   —"))
         self.lbl_pbf.configure(
-            text=tr("Файли   {pct:5.1f}%   {done} / {total}{tail}",
+            text=tr(whole_f if whole else job_f,
                     pct=ff * 100, done=done_f, total=total_f, tail=tail_f)
             if total_f else tr("Файли   —"))
         # відсоток дублюємо в заголовок: видно на панелі задач, коли вікно згорнуте

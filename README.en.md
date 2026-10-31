@@ -128,11 +128,65 @@ The token lands in `rclone.conf` (`rclone config file` prints the path).
 **It is the key to the account — never publish it or put it in a
 repository.** It is already in `.gitignore`.
 
-> rclone's shared `client_id` is being retired during 2026. To keep uploads
-> working it is worth creating your own:
-> [rclone.org/drive/#making-your-own-client-id](https://rclone.org/drive/#making-your-own-client-id).
-> The client type is **Desktop app**, and the consent screen must be
-> **published**, otherwise Google revokes the token every 7 days.
+## Your own client_id — worth doing straight away
+
+While `client_id` and `client_secret` are left empty in `rclone config`,
+rclone talks to Google under a **shared** account, one for all of its users
+worldwide. The API quota is shared as well, so at a busy hour an upload runs
+into `403 rate limit` even when you yourself make only a few requests per
+second. Your own `client_id` gives you a quota of your own — and that is the
+only thing that really cures the 403.
+
+On top of that, Google is retiring the shared `client_id` during 2026, so
+sooner or later this has to be done anyway.
+
+The procedure is free and takes about a quarter of an hour. The official
+description:
+[rclone.org/drive/#making-your-own-client-id](https://rclone.org/drive/#making-your-own-client-id).
+
+### Step by step
+
+1. Open [console.cloud.google.com](https://console.cloud.google.com/) under
+   the account whose Drive you are going to use.
+2. Create a project: the project switcher at the top left → **New project** →
+   any name → **Create**. Then make sure that project is the one selected at
+   the top.
+3. Enable the API: **APIs & Services → Library** → find **Google Drive API** →
+   **Enable**. Without this step nothing else will work.
+4. Fill in the consent screen: **APIs & Services → OAuth consent screen** →
+   type **External** → the application name, your support email and developer
+   contact email. For the privacy policy field you may use a link to this
+   repository's [PRIVACY.en.md](PRIVACY.en.md).
+5. Add the permission: at the **Scopes** step → **Add or remove scopes** →
+   `https://www.googleapis.com/auth/drive` (full access to Drive).
+6. **Publish the app** — the **Publish app** button. This matters: while the
+   state stays *Testing*, Google revokes the token every 7 days and you would
+   have to authorise again every week.
+7. Create the keys: **APIs & Services → Credentials → Create credentials →
+   OAuth client ID** → type **Desktop app** → any name → **Create**. A dialog
+   appears with the `client_id` and the `client_secret`.
+8. Put them into rclone:
+
+   ```
+   rclone config
+   ```
+
+   `e` (edit existing remote) → pick your remote → paste the values into the
+   `client_id` and `client_secret` fields → leave everything else as it is →
+   answer `y` when asked about re-authorising, and sign in again in the
+   browser.
+
+Use `e`, not `n`: that way the rest of the remote's settings (including
+`root_folder_id`, if you have one) are preserved.
+
+During sign-in Google will warn that the app is not verified —
+**Advanced → Go to … (unsafe)**. That is expected: verification is for public
+services, whereas here the app is your own and you are granting access to
+yourself.
+
+To check that it worked: `rclone lsd gdrive:` should still list your folders,
+and rclone's warning line about the shared `client_id` will disappear from
+the program's log.
 
 ## Running it
 
@@ -283,26 +337,31 @@ There are three bars, because one does not describe a mixed queue:
 
 ```
 ████████▏
-File    30.0%   240.0 MB / 800.0 MB   ·   holiday_2026.mp4   (+1)
+File    30.0%  240.0 MB / 800.0 MB  (+1)  ·  Lectures/Testing basics 7.5.mp4
 
-██▍                            ████▎
-Size     7.8%  240 MB / 3.0 GB   Files   16.9%   204 / 1205
-          · job 23%                      · job 17%
+██▍                                ████▎
+Size  queue 7.8%  240 MB / 3.0 GB    Files  queue 16.9%  204 / 1205
+       · job 23%                            · job 17%
 
 6.1 MB/s (avg 5.8 MB/s) · ETA 15m 00s · checked 4 · errors 0
 Queue: job 1 of 2 · actually transferred 200 files, 240.0 MB
 ```
 
-The top bar is about the file going right now and takes the full width. When
-there are several threads it shows the largest of them, because that is what
+**Queue** and **job** are two different percentages. A job is one
+source → destination pair from the queue (and in two-pass mode, one pass over
+it). So 7.8% of the queue and 23% of the job in the example above do not
+contradict each other: the first of two jobs is a quarter done.
+
+The top bar is about the file going right now and takes the full width. The
+name is written out in full, including the subfolder inside the job. When
+there are several threads the bar shows the largest file, because that is what
 decides how long the wait is; how many files are going alongside is in
-brackets, and their names are on the line below.
+brackets before the name, and their names are on the line below.
 
 The two lower bars are about the whole queue, half the width each. By count it
 can be nearly everything while by volume it is a fifth, because one large file
 weighs more than hundreds of small ones. With a single bar the picture would
-be either too optimistic or too gloomy. Next to the queue percentage stands
-the percentage of the job that is running.
+be either too optimistic or too gloomy.
 
 The **Measure the queue** checkbox (on by default) runs `rclone size` over
 every job before the transfer, so from the first second the bars show a share
@@ -443,3 +502,9 @@ been connected to it yet. That is the
 **The window opened somewhere off screen** — this happens after unplugging a
 second monitor. The program brings it back to a visible place on the next
 start.
+
+**`403 rate limit` errors in the log** — what limits you is Google's quota,
+not your connection. With an empty `client_id` that quota is shared by all
+rclone users, and your own `--tpslimit` barely changes anything. The cure is
+a key of your own:
+[«Your own client_id»](#your-own-client_id--worth-doing-straight-away).
