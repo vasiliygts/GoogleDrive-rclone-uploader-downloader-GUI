@@ -6,7 +6,7 @@ A visual front end for [rclone](https://rclone.org) and Google Drive: two trees
 side by side, a job queue, live progress, uploads and downloads.
 Python + tkinter, no pip dependencies at all.
 
-![Application window](Screenshot/Screenshot.png)
+![Application window](Screenshot/Screenshot_2.png)
 
 The interface speaks both languages: pick **Language** in the top bar, the
 choice is remembered.
